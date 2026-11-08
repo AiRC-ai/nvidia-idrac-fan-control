@@ -2,6 +2,8 @@
 
 A read-only terminal dashboard for the NVIDIA GPU and iDRAC cooling telemetry. It shows live measurements and rolling history in the style of `htop` and `nvtop`.
 
+Version 0.2.0 expands the charts to use tall terminal windows. GPU temperature, utilization, and board power have labeled scales and time axes; core and HBM use separate colors, and power uses amber. VRAM, individual fan PWM/RPM histories, and inlet/exhaust trends remain visible alongside current readings. Smaller terminals retain the compact layout.
+
 The dashboard is separate from the fan controller. Starting, pausing, or quitting it does not change fans, power limits, models, or services. It never opens a BMC connection. NVIDIA's optional local telemetry query supplies device names, VRAM, power limits, and clocks; it does not run a GPU workload.
 
 The original deployment uses a Dell PowerEdge R730 with iDRAC8, two Tesla V100 PCIe 32 GB cards, and a Debian GPU guest on ESXi. The display is observational: fan rotation and temperatures do not certify sufficient heatsink airflow.
@@ -30,9 +32,9 @@ sudo cooltop --history 60
 sudo cooltop --ascii --no-gpu-query
 ```
 
-The default display refreshes once per second; the optional NVIDIA query runs every five seconds with a two-second command timeout. `--no-gpu-query` disables that query entirely. The dashboard displays the first two GPUs and up to six fans; larger GPU inventories are marked. For the full panel layout, use a terminal at least 120 columns wide and 36 rows high. A compact 80×24 layout is supported.
+The default display refreshes once per second; the optional NVIDIA query runs every five seconds with a two-second command timeout. `--no-gpu-query` disables that query entirely. The dashboard displays the first two GPUs and up to six fans; larger GPU inventories are marked. At 44 rows or taller, the available height becomes chart resolution. Windows with 36–43 rows use an expanded temperature chart and compact load/power histories. A 160×60 terminal gives a spacious view; 80×24 remains supported with compact panels.
 
-History begins when the dashboard starts. It is held in memory and discarded on exit. Missing or stale observations are gaps, rather than fabricated zero values. Requested fan floor and measured fan PWM/RPM are displayed separately. A loaded model can consume VRAM while GPU utilization is idle.
+History begins when the dashboard starts. It is held in memory and discarded on exit. Trend charts use step-held cached readings only while their source remains valid; bins show the peak measurement so brief thermal/load spikes remain visible. Gaps indicate unavailable or expired telemetry. Stored measurements remain actual deduplicated observations. Requested fan floor and measured fan PWM/RPM are displayed separately. A loaded model can consume VRAM while GPU utilization is idle.
 
 ## Install manually
 

@@ -187,30 +187,117 @@ def normalize(raw, guard, *, boot, mono, wall, status_error=None, guard_error=No
 
 
 class History:
-    """Actual sample events only; redraws and repeated cached observations add nothing."""
+    """Keep actual observations; derive step-held display segments only at render time.
+
+    Cached reads never append observations or renew expiry. Each displayed hold
+    ends at the next observation, its original source TTL, or an explicit source
+    failure. Validity transitions are separate from measured sample events.
+    """
     def __init__(self, seconds=600, max_samples=10000):
         self.seconds, self.max_samples = max(10, seconds), max(10, max_samples)
-        self.values, self.tokens = {}, {}
+        self.values, self.tokens, self._segments = {}, {}, {}
+        self._availability, self._states, self._sources = {}, {}, {}
 
-    def add(self, key, observed, value, token, now):
+    def _available(self, key, available, when):
+        if self._states.get(key) is available:
+            return
+        events = self._availability.setdefault(key, deque(maxlen=self.max_samples))
+        when = max(when, events[-1][0]) if events else when
+        events.append((when, available))
+        self._states[key] = available
+        while len(events) > 1 and events[1][0] < when - self.seconds:
+            events.popleft()
+
+    def invalidate(self, key, now):
+        """Stop a hold immediately when the collector detects unavailable input."""
+        self._available(key, False, now)
+
+    def add(self, key, observed, value, token, now, ttl=0, source=None):
         if num(value) is None or num(observed) is None or observed > now or observed < now - self.seconds:
+            self.invalidate(key, now)
             return
+        ttl = num(ttl, 0, 3600) or 0
         series = self.values.setdefault(key, deque(maxlen=self.max_samples))
-        if (key in self.tokens and self.tokens[key] == token) or (series and observed <= series[-1][0]):
+        segments = self._segments.setdefault(key, deque(maxlen=self.max_samples))
+        if key in self.tokens and self.tokens[key] == token:
+            # A restored cached sample may be shown again only for the remainder
+            # of its original validity period. Its measurement is not duplicated.
+            if segments and (segments[-1][2] >= now or ttl == 0 and observed == now):
+                self._available(key, True, now)
+            else:
+                self.invalidate(key, now)
             return
-        self.tokens[key] = token
+        start = observed
+        if series and observed <= series[-1][0]:
+            if source == self._sources.get(key):
+                self.invalidate(key, now)
+                return
+            # A fresh alternate sensor can be older than the previous sensor.
+            # Preserve its true timestamp but start its display at source switch.
+            start = now
+        events = self._availability.get(key, ())
+        if events and events[-1][1] is False and start <= events[-1][0]:
+            start = now
+        if segments and start < segments[-1][0]:
+            start = now
+        expires = observed + ttl
+        if ttl and expires < start:
+            self.invalidate(key, now)
+            return
+        self.tokens[key], self._sources[key] = token, source
         series.append((observed, value))
+        segments.append((start, value, expires, ttl == 0))
+        self._available(key, True, start)
         while series and series[0][0] < now - self.seconds:
             series.popleft()
+        while segments and segments[0][2] < now - self.seconds:
+            segments.popleft()
 
-    def bins(self, key, now, seconds=300, width=60):
+    def _valid_ranges(self, key, start, end):
+        available, cursor = True, start
+        for when, state in self._availability.get(key, ()):
+            if when <= start:
+                available = state
+            elif when < end:
+                if available and when > cursor:
+                    yield cursor, when
+                cursor, available = when, state
+            else:
+                break
+        if available and end > cursor:
+            yield cursor, end
+
+    def _valid_point(self, key, when):
+        available = True
+        for event_time, state in self._availability.get(key, ()):
+            if event_time > when:
+                break
+            available = state
+        return available
+
+    def bins(self, key, now, seconds=300, width=60, aggregation='max'):
+        if aggregation not in ('max', 'min', 'last'):
+            raise ValueError('aggregation must be max, min, or last')
         width = max(1, min(1000, int(width)))
         seconds = max(1, min(float(seconds), self.seconds))
         result = [None] * width
-        for observed, value in self.values.get(key, ()):
-            if now - seconds <= observed <= now:
-                position = min(width - 1, int((observed - (now - seconds)) / seconds * width))
-                result[position] = value
+        base, step = now - seconds, seconds / width
+        def apply(position, value):
+            if 0 <= position < width:
+                old = result[position]
+                result[position] = value if old is None or aggregation == 'last' else max(old, value) if aggregation == 'max' else min(old, value)
+        segments = self._segments.get(key, ())
+        for index, (start, value, expires, point) in enumerate(segments):
+            if point:
+                if base <= start <= now and self._valid_point(key, start):
+                    apply(min(width - 1, int((start - base) / step)), value)
+                continue
+            end = min(expires, now, segments[index + 1][0] if index + 1 < len(segments) else now)
+            for left, right in self._valid_ranges(key, max(base, start), end):
+                first = max(0, int((left - base) / step))
+                last = min(width - 1, math.ceil((right - base) / step) - 1)
+                for position in range(first, last + 1):
+                    apply(position, value)
         return result
 
 
@@ -328,6 +415,14 @@ class Collector:
                                                 core_age_seconds=None, core_source='unavailable', stats_fresh=False,
                                                 stats_age_seconds=None, stats_source='unavailable', details_fresh=False, details_age_seconds=None))
             snapshot['gpus'].sort(key=lambda row: row['index'])
+        fresh_keys = set()
+        diagnostics = obj(obj(raw).get('cooling_diagnostics'))
+        physical = obj(diagnostics.get('physical_diagnostics'))
+        physical_ttl = min(90, num(physical.get('max_age_seconds'), 1, 3600) or 90)
+        gpu_diags = {r.get('gpu'): r for r in rows(diagnostics.get('gpu_diagnostics')) if type(r.get('gpu')) is int}
+        def record(key, observed, value, token, ttl, source):
+            fresh_keys.add(key)
+            self._history.add(key, observed, value, token, mono, ttl=ttl, source=source)
         for gpu in snapshot['gpus']:
             details_fresh = detail_age is not None and 0 <= detail_age <= 15
             if gpu['index'] in detail_rows:
@@ -349,24 +444,41 @@ class Collector:
                 age = detail_age if field == 'memory_used_mb' else gpu['core_age_seconds'] if field in ('core_c', 'hbm_c') else gpu['stats_age_seconds']
                 observed = mono - age if age is not None else None
                 if fresh:
-                    self._history.add(prefix + field, observed, gpu.get(field), round(observed, 3), mono)
+                    source = 'nvidia-smi' if field == 'memory_used_mb' else gpu['core_source'] if field in ('core_c', 'hbm_c') else gpu['stats_source']
+                    if source == 'nvidia-smi':
+                        ttl, identity = 15, detail_time
+                    elif source == 'guard':
+                        ttl, identity = 10, (obj(guard).get('invocation_id'), obj(guard).get('monotonic'))
+                    else:
+                        diag = gpu_diags.get(gpu['index'], {})
+                        ttl = min(10, num(diag.get('max_age_seconds'), 1, 3600) or 10)
+                        identity = num(diag.get('observed_time_unix'), 0) or obj(raw).get('monotonic')
+                    token = (source, obj(raw).get('boot_id') if source == 'watchdog' else obj(guard).get('boot_id') if source == 'guard' else self.boot, identity)
+                    record(prefix + field, observed, gpu.get(field), token, ttl, source)
+        physical_identity = num(physical.get('observed_time_unix'), 0)
         for fan in snapshot['fans']:
             if fan['fresh']:
                 observed = mono - fan['age_seconds']
+                token = ('physical', obj(raw).get('boot_id'), physical_identity if physical_identity is not None else round(observed, 3))
                 for field in ('rpm', 'pwm_pct'):
-                    self._history.add(f"fan.{fan['fan_id']}.{field}", observed, fan[field], round(observed, 3), mono)
+                    record(f"fan.{fan['fan_id']}.{field}", observed, fan[field], token, physical_ttl, 'physical')
         for sensor in snapshot['temperatures']:
             if sensor['fresh']:
                 observed = mono - sensor['age_seconds']
-                self._history.add(f"temperature.{sensor['kind']}.{sensor['index']}", observed, sensor['temperature_c'], round(observed, 3), mono)
+                token = ('physical', obj(raw).get('boot_id'), physical_identity if physical_identity is not None else round(observed, 3))
+                record(f"temperature.{sensor['kind']}.{sensor['index']}", observed, sensor['temperature_c'], token, physical_ttl, 'physical')
         if snapshot['status']['fresh']:
-            self._history.add('cooling.requested_floor_pct', mono - snapshot['status']['age_seconds'], snapshot['cooling']['requested_floor_pct'], obj(raw).get('monotonic'), mono)
+            token = ('watchdog', obj(raw).get('boot_id'), obj(raw).get('invocation_id'), obj(raw).get('monotonic'))
+            record('cooling.requested_floor_pct', mono - snapshot['status']['age_seconds'], snapshot['cooling']['requested_floor_pct'], token, 90, 'watchdog')
         for field in ('cpu_pct', 'mem_pct'):
-            self._history.add('system.' + field, mono, snapshot['system'][field], mono, mono)
+            record('system.' + field, mono, snapshot['system'][field], mono, 2, 'host')
+        for key in self._history.values:
+            if key not in fresh_keys:
+                self._history.invalidate(key, mono)
         return snapshot
 
-    def history(self, key, seconds=300, width=60):
-        return self._history.bins(key, self._now, seconds, width)
+    def history(self, key, seconds=300, width=60, aggregation='max'):
+        return self._history.bins(key, self._now, seconds, width, aggregation)
 
     def close(self):
         if self.details:

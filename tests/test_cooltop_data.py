@@ -160,6 +160,57 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(history.bins('absent', 100, 100, 4), [None] * 4)
 
 
+    def test_step_hold_uses_original_remaining_ttl_not_ingestion_time(self):
+        history = History()
+        history.add('fan', 80, 55, 'sample', 100, ttl=30)
+        history.add('fan', 80, 55, 'sample', 105, ttl=30)
+        self.assertEqual(len(history.values['fan']), 1)
+        bins = history.bins('fan', 120, 40, 40)
+        self.assertEqual(bins[:30], [55] * 30)
+        self.assertEqual(bins[30:], [None] * 10)
+        history.add('fan', 80, 55, 'sample', 120, ttl=30)
+        self.assertEqual(history.bins('fan', 140, 20, 20), [None] * 20)
+
+    def test_error_and_cached_recovery_leave_gap_and_original_expiry(self):
+        history = History()
+        history.add('fan', 80, 55, 'sample', 90, ttl=30)
+        history.invalidate('fan', 100)
+        history.add('fan', 80, 55, 'sample', 105, ttl=30)
+        bins = history.bins('fan', 120, 40, 40)
+        self.assertEqual(bins[:20], [55] * 20)
+        self.assertEqual(bins[20:25], [None] * 5)
+        self.assertEqual(bins[25:30], [55] * 5)
+        self.assertEqual(bins[30:], [None] * 10)
+        self.assertEqual(len(history.values['fan']), 1)
+
+    def test_new_observation_after_error_may_resume_at_measurement_time(self):
+        history = History()
+        history.add('fan', 80, 55, 'old', 90, ttl=30)
+        history.invalidate('fan', 100)
+        history.add('fan', 104, 60, 'new', 105, ttl=10)
+        bins = history.bins('fan', 120, 40, 40)
+        self.assertEqual(bins[20:24], [None] * 4)
+        self.assertEqual(bins[24:34], [60] * 10)
+        self.assertEqual(bins[34:], [None] * 6)
+
+    def test_peak_aggregation_preserves_brief_temperature_spike(self):
+        history = History()
+        for observed, value in ((80, 40), (85, 80), (86, 45)):
+            history.add('gpu', observed, value, observed, observed, ttl=20)
+        self.assertEqual(history.bins('gpu', 90, 20, 1), [80])
+        self.assertEqual(history.bins('gpu', 90, 20, 1, 'last'), [45])
+        self.assertEqual(history.bins('gpu', 90, 20, 1, 'min'), [40])
+
+    def test_older_alternate_sensor_starts_at_switch_without_backfill(self):
+        history = History()
+        history.add('core', 100, 50, ('guard', 100), 100, ttl=10, source='guard')
+        history.add('core', 98, 45, ('nvidia', 98), 102, ttl=15, source='nvidia')
+        bins = history.bins('core', 110, 10, 10)
+        self.assertEqual(bins[:2], [50, 50])
+        self.assertEqual(bins[2:], [45] * 8)
+        self.assertEqual(list(history.values['core']), [(100, 50), (98, 45)])
+
+
 class CollectorTests(unittest.TestCase):
     def test_cached_default_starts_no_external_process_and_dedupes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,6 +237,47 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(len(c._history.values['gpu.0.core_c']), 1)
             self.assertEqual(len(c._history.values['fan.1.rpm']), 1)
             self.assertTrue(second['fans'][0]['fresh'])
+
+    def test_missing_physical_source_ends_hold_at_detection_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'sys/kernel/random').mkdir(parents=True)
+            (root / 'sys/kernel/random/boot_id').write_text(BOOT)
+            (root / 'status').write_text(json.dumps(fixture()))
+            (root / 'guard').write_text(json.dumps(guard_fixture()))
+            c = Collector(root / 'status', root / 'guard', proc_root=root)
+            with mock.patch('cooltop_data.time.monotonic', return_value=101):
+                c.sample()
+            (root / 'status').unlink()
+            with mock.patch('cooltop_data.time.monotonic', return_value=110):
+                c.sample()
+            bins = c._history.bins('fan.1.pwm_pct', 120, 40, 40)
+            self.assertEqual(bins[:30], [55] * 30)
+            self.assertEqual(bins[30:], [None] * 10)
+            self.assertEqual(len(c._history.values['fan.1.pwm_pct']), 1)
+            c.close()
+
+    def test_physical_observation_identity_survives_publication_clock_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'sys/kernel/random').mkdir(parents=True)
+            (root / 'sys/kernel/random/boot_id').write_text(BOOT)
+            raw = fixture()
+            physical = raw['cooling_diagnostics']['physical_diagnostics']
+            physical['observed_time_unix'] = 1767225580
+            (root / 'status').write_text(json.dumps(raw))
+            (root / 'guard').write_text(json.dumps(guard_fixture()))
+            c = Collector(root / 'status', root / 'guard', proc_root=root)
+            with mock.patch('cooltop_data.time.monotonic', return_value=101):
+                c.sample()
+            raw['monotonic'] = 110
+            physical['age_seconds'] = 30.003
+            (root / 'status').write_text(json.dumps(raw))
+            with mock.patch('cooltop_data.time.monotonic', return_value=111):
+                c.sample()
+            self.assertEqual(len(c._history.values['fan.1.pwm_pct']), 1)
+            self.assertEqual(c._history._segments['fan.1.pwm_pct'][0][2], 170)
+            c.close()
 
     def test_missing_files_are_reported_without_crash(self):
         with tempfile.TemporaryDirectory() as tmp:

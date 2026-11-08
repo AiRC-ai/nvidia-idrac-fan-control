@@ -16,11 +16,11 @@ import time
 
 from cooltop_data import Collector
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_STATUS = "/var/lib/airc-gpu-fan-watchdog/status.json"
 DEFAULT_GUARD = "/run/airc-gpu-thermal-guard/guard.json"
 SPANS = (60, 300, 900)
-NORMAL, DIM, TITLE, GOOD, WARN, BAD, CYAN, BLUE = range(8)
+NORMAL, DIM, TITLE, GOOD, WARN, BAD, CYAN, BLUE, PURPLE, GRID = range(10)
 
 
 def clean(value):
@@ -75,10 +75,10 @@ class Canvas:
             if 0 <= x + i < self.width:
                 self.cells[y][x + i] = (character, style)
 
-    def rule(self, y, x, width, style=DIM):
+    def rule(self, y, x, width, style=GRID):
         self.put(y, x, ("-" if self.ascii else "─") * max(0, width), style)
 
-    def box(self, y, x, width, height, title="", style=DIM):
+    def box(self, y, x, width, height, title="", style=GRID):
         if width < 2 or height < 2:
             return
         tl, tr, bl, br, vert = ("+", "+", "+", "+", "|") if self.ascii else ("┌", "┐", "└", "┘", "│")
@@ -119,7 +119,100 @@ class Canvas:
 
 
 def history(collector, key, span, width):
-    return collector.history(key, seconds=span, width=max(1, width)) if collector else []
+    if not collector:
+        return []
+    try:
+        return collector.history(key, seconds=span, width=max(1, width), aggregation="max")
+    except TypeError:
+        return collector.history(key, seconds=span, width=max(1, width))
+
+
+def axis_time(seconds):
+    if seconds >= 60:
+        minutes, secs = divmod(int(seconds), 60)
+        return f"-{minutes}m{secs:02d}s" if secs else f"-{minutes}m"
+    return f"-{int(seconds)}s"
+
+
+def chart(canvas, y, x, width, height, title, series, maximum, span, *, minimum=0, unit="", area=False):
+    """Scaled multirow history chart. Series are (label, values, style) tuples."""
+    if height < 4 or width < 18:
+        return
+    canvas.put(y, x, title[:width], TITLE)
+    label_width = 6
+    plot_x, plot_y = x + label_width, y + 1
+    plot_w, plot_h = width - label_width, height - 2
+    low, high = minimum, maximum
+    if not numeric(low) or not numeric(high) or high <= low:
+        low, high = 0, 100
+    # Fixed scale makes separate frames and GPUs directly comparable.
+    ticks = {0: high, plot_h - 1: low}
+    if plot_h >= 3:
+        middle_row = (round((plot_h * 4 - 1) / 2) // 4 if not canvas.ascii and not area else
+                      plot_h - 1 - round((plot_h - 1) / 2))
+        ticks[middle_row] = (high + low) / 2
+    for row in range(plot_h):
+        if row in ticks:
+            value = ticks[row]
+            label = f"{value:.0f}" if abs(value) < 1000 else f"{value / 1000:.0f}k"
+            canvas.put(plot_y + row, x, label[-4:].rjust(4), DIM)
+            canvas.put(plot_y + row, plot_x - 1, "|" if canvas.ascii else "┤", GRID)
+            canvas.rule(plot_y + row, plot_x, plot_w, GRID)
+        else:
+            canvas.put(plot_y + row, plot_x - 1, "|" if canvas.ascii else "│", GRID)
+    have_data = False
+    occupied = {}
+    for label, values, style in series:
+        vals = list(values)[-plot_w:]
+        vals = [None] * (plot_w - len(vals)) + vals
+        previous = None
+        for col, value in enumerate(vals):
+            if not numeric(value):
+                previous = None
+                continue
+            have_data = True
+            pos = (max(low, min(high, value)) - low) / (high - low) * (plot_h - 1)
+            row = plot_h - 1 - round(pos)
+            if area:
+                for fill_row in range(row + 1, plot_h):
+                    canvas.put(plot_y + fill_row, plot_x + col, "|" if canvas.ascii else "│", style)
+                canvas.put(plot_y + row, plot_x + col, "#" if canvas.ascii else "▄", style)
+            else:
+                subpixel = round((high - max(low, min(high, value))) / (high - low) * (plot_h * 4 - 1))
+                if not canvas.ascii:
+                    row = subpixel // 4
+                if previous is not None and abs(previous - row) > 1:
+                    for join_row in range(min(previous, row) + 1, max(previous, row)):
+                        canvas.put(plot_y + join_row, plot_x + col, "|" if canvas.ascii else "│", style)
+                key = (row, col)
+                same = key in occupied
+                if canvas.ascii:
+                    character = "X" if same else "+"
+                    occupied[key] = (0, style)
+                else:
+                    # Four vertical braille dots per cell keep small thermal
+                    # differences visible without changing the stable scale.
+                    mask = (1, 2, 4, 64)[subpixel % 4]
+                    if same:
+                        mask |= occupied[key][0]
+                    character = chr(0x2800 + mask)
+                    occupied[key] = (mask, style)
+                canvas.put(plot_y + row, plot_x + col, character, TITLE if same else style)
+            previous = row
+    if not have_data:
+        message = "Awaiting fresh samples"
+        canvas.put(plot_y + plot_h // 2, plot_x + max(0, (plot_w - len(message)) // 2), message[:plot_w], DIM)
+    axis_y = y + height - 1
+    for fraction, label in ((0, axis_time(span)), (0.5, axis_time(span / 2)), (1, "now")):
+        xx = plot_x + round(fraction * (plot_w - 1))
+        if fraction == 1:
+            xx -= len(label) - 1
+        elif fraction == 0.5:
+            xx -= len(label) // 2
+        canvas.put(axis_y, xx, label, DIM)
+    if unit:
+        canvas.put(y, x + max(0, width - len(unit)), unit, DIM)
+
 
 
 def gpu_panel(canvas, snapshot, collector, gpu, y, x, width, height, span):
@@ -155,7 +248,27 @@ def gpu_panel(canvas, snapshot, collector, gpu, y, x, width, height, span):
     if not gpu.get("details_fresh"):
         memory_text = "* " + memory_text
     canvas.put(y + 5, xx, memory_text[:inner], NORMAL if gpu.get("details_fresh") else DIM)
-    if height >= 12:
+    memory_bar_x = len(memory_text) + 2
+    if numeric(used) and numeric(total) and inner - memory_bar_x >= 6:
+        canvas.bar(y + 5, xx + memory_bar_x, inner - memory_bar_x, used, total, PURPLE if gpu.get("details_fresh") else WARN)
+    if height >= 17:
+        graph_width = inner - 6
+        chart_height = height - 11
+        chart(canvas, y + 6, xx, inner, chart_height, "TEMPERATURE", [
+            ("CORE", history(collector, f"gpu.{idx}.core_c", span, graph_width), CYAN),
+            ("HBM", history(collector, f"gpu.{idx}.hbm_c", span, graph_width), PURPLE),
+        ], 100, span, unit="°C")
+        canvas.put(y + 6, xx + 14, "CORE", CYAN)
+        canvas.put(y + 6, xx + 20, "HBM", PURPLE)
+        for row, label, key, maximum, style in (
+            (height - 5, "LOAD", "util_pct", 100, CYAN),
+            (height - 4, "WATT", "power_w", limit or 300, BLUE),
+        ):
+            canvas.put(y + row, xx, label, style)
+            canvas.spark(y + row, xx + 5, history(collector, f"gpu.{idx}.{key}", span, inner - 5), inner - 5, maximum, style)
+        canvas.put(y + height - 3, xx, f"SM {fmt(gpu.get('sm_clock_mhz'), 'MHz')} · HBM {fmt(gpu.get('memory_clock_mhz'), 'MHz')}{'' if gpu.get('details_fresh') else '*'}"[:inner], NORMAL if gpu.get("details_fresh") else WARN)
+        canvas.put(y + height - 2, xx, f"T {age(gpu.get('core_age_seconds'))} · load {age(gpu.get('stats_age_seconds'))}"[:inner], NORMAL if fresh and stats_fresh else WARN)
+    elif height >= 12:
         graph_width = max(1, inner - 5)
         canvas.put(y + 6, xx, "CORE", core_style)
         canvas.spark(y + 6, xx + 5, history(collector, f"gpu.{idx}.core_c", span, graph_width), graph_width, core_cut, core_style)
@@ -219,7 +332,7 @@ def draw_cooling(canvas, snapshot, y, x, width, height):
     canvas.put(y + 1, xx, mode[:inner], BAD if fault else GOOD if verified and status_fresh and not degraded else WARN)
     canvas.put(y + 2, xx, f"Guard {'HEALTHY' if guard_ok else 'UNCONFIRMED'} · {age(guard.get('age_seconds'))}"[:inner], GOOD if guard_ok else WARN)
     route = cool.get("control_path") or "unknown"
-    canvas.put(y + 3, xx, f"iDRAC route {route} · {'verified' if cool.get('control_verified') else 'unverified'}"[:inner], NORMAL if cool.get("setting_fresh") else WARN)
+    canvas.put(y + 3, xx, f"iDRAC route {route} · {'verified' if status_fresh and cool.get('setting_fresh') and cool.get('control_verified') else 'unverified'}"[:inner], NORMAL if cool.get("setting_fresh") else WARN)
     canvas.put(y + 4, xx, f"Floor {fmt(cool.get('requested_floor_pct'), '%')} · idle {fmt(cool.get('idle_min_pct'), '%')}–{fmt(cool.get('idle_max_pct'), '%')}"[:inner], NORMAL)
     if height >= 11:
         canvas.put(y + 5, xx, f"Thermal cutoffs core {fmt(cool.get('cutoff_core_c'), 'C')} / HBM {fmt(cool.get('cutoff_hbm_c'), 'C')}"[:inner], DIM)
@@ -241,7 +354,7 @@ def draw_cooling(canvas, snapshot, y, x, width, height):
             canvas.put(y + 5 + line, xx, "  ".join(labels[line * 2:line * 2 + 2])[:inner], NORMAL)
 
 
-def render_dashboard(snapshot, collector=None, *, width=120, height=40, span=300, ascii_only=False, paused=False):
+def render_compact(snapshot, collector=None, *, width=120, height=40, span=300, ascii_only=False, paused=False):
     c = Canvas(width, height, ascii_only)
     if width < 70 or height < 23:
         c.put(0, 0, "cooltop · READ ONLY", TITLE)
@@ -276,7 +389,7 @@ def render_dashboard(snapshot, collector=None, *, width=120, height=40, span=300
     if height >= 29:
         c.spark(3, 12, history(collector, "system.cpu_pct", span, max(1, half - 15)), max(1, half - 15), 100, CYAN)
     full = height >= 32
-    gpu_height = 13 if full else 9
+    gpu_height = max(13, height - 19) if full else 9
     gpu_y = 5 if full else 4 if height >= 29 else 3
     left_width = (width - 3) // 2
     right_width = width - 3 - left_width
@@ -308,6 +421,182 @@ def render_dashboard(snapshot, collector=None, *, width=120, height=40, span=300
     return c
 
 
+def draw_gpu_rich(c, snapshot, collector, gpu, y, x, width, height, span):
+    idx = gpu.get("index", "?")
+    name = clean(gpu.get("name") or "NVIDIA GPU")
+    c.box(y, x, width, height, f"GPU {idx}  {name[:width - 14]}")
+    xx, inner = x + 2, width - 4
+    core, hbm = gpu.get("core_c"), gpu.get("hbm_c")
+    core_fresh = gpu.get("core_fresh") is True
+    hbm_fresh = gpu.get("hbm_fresh", core_fresh) is True
+    stats_fresh, details_fresh = gpu.get("stats_fresh") is True, gpu.get("details_fresh") is True
+    cool = snapshot.get("cooling", {})
+    cutoff_core, cutoff_hbm = cool.get("cutoff_core_c") or 80, cool.get("cutoff_hbm_c") or 85
+    third = inner // 3
+    for offset, label, value, fresh, style in (
+        (0, "CORE", fmt(core, "°C"), core_fresh, temperature_style(core, cutoff_core)),
+        (third, "HBM", fmt(hbm, "°C"), hbm_fresh, temperature_style(hbm, cutoff_hbm)),
+        (third * 2, "LOAD", fmt(gpu.get("util_pct"), "%"), stats_fresh, CYAN),
+    ):
+        c.put(y + 1, xx + offset, f"{label} {value}{'' if fresh else '*'}", style if fresh else WARN)
+    limit, power = gpu.get("power_limit_w"), gpu.get("power_w")
+    power_label = f"POWER {fmt(power, 'W')}{'' if stats_fresh else '*'} / {fmt(limit, 'W')}{'' if details_fresh else '*'}"
+    c.put(y + 2, xx, power_label[:inner], BLUE if stats_fresh else WARN)
+    clock_label = f"SM {fmt(gpu.get('sm_clock_mhz'), 'MHz')} · HBM {fmt(gpu.get('memory_clock_mhz'), 'MHz')}{'' if details_fresh else '*'}"
+    if inner >= 60:
+        c.put(y + 2, xx + 30, clock_label[:inner - 30], NORMAL if details_fresh else WARN)
+    used, total = gpu.get("memory_used_mb"), gpu.get("memory_total_mb")
+    vram_label = f"VRAM {used / 1024:.1f}/{total / 1024:.1f} GiB" if numeric(used) and numeric(total) else "VRAM --"
+    vram_label += "" if details_fresh else "*"
+    c.put(y + 3, xx, vram_label, PURPLE if details_fresh else WARN)
+    bar_start = min(inner - 6, len(vram_label) + 2)
+    c.bar(y + 3, xx + bar_start, inner - bar_start, used, total, PURPLE if details_fresh else WARN)
+    source = gpu.get("core_source") or "temps"
+    freshness = f"{source} {age(gpu.get('core_age_seconds'))} · load {age(gpu.get('stats_age_seconds'))}"
+    if inner < 60:
+        freshness = clock_label
+    c.put(y + 4, xx, freshness[:inner], NORMAL if core_fresh and stats_fresh else WARN)
+    available = height - 6
+    heights = [available // 3] * 3
+    for i in range(available % 3):
+        heights[i] += 1
+    graph_y = y + 5
+    graph_width = inner - 6
+    core_hist = history(collector, f"gpu.{idx}.core_c", span, graph_width)
+    hbm_hist = history(collector, f"gpu.{idx}.hbm_c", span, graph_width)
+    chart(c, graph_y, xx, inner, heights[0], "TEMPERATURE", [("CORE", core_hist, CYAN), ("HBM", hbm_hist, PURPLE)], 100, span, unit="°C")
+    c.put(graph_y, xx + 14, "CORE", CYAN)
+    c.put(graph_y, xx + 20, "HBM", PURPLE)
+    if inner >= 60 and numeric(cool.get("cutoff_core_c")) and numeric(cool.get("cutoff_hbm_c")):
+        c.put(graph_y, xx + 26, f"cutoff {fmt(cutoff_core)}/{fmt(cutoff_hbm)}C", DIM)
+    graph_y += heights[0]
+    util_hist = history(collector, f"gpu.{idx}.util_pct", span, graph_width)
+    chart(c, graph_y, xx, inner, heights[1], "GPU UTILIZATION", [("LOAD", util_hist, CYAN)], 100, span, unit="%", area=True)
+    graph_y += heights[1]
+    power_hist = history(collector, f"gpu.{idx}.power_w", span, graph_width)
+    chart(c, graph_y, xx, inner, heights[2], "BOARD POWER", [("WATT", power_hist, BLUE)], limit or 300, span, unit="W", area=True)
+
+
+def draw_fans_rich(c, snapshot, collector, y, x, width, height, span):
+    c.box(y, x, width, height, "CHASSIS FANS · measured feedback")
+    xx, inner = x + 2, width - 4
+    fans = snapshot.get("fans", [])[:6]
+    double = height >= 17
+    c.put(y + 1, xx, "FAN     RPM   PWM      ACTUAL PWM / HISTORY"[:inner], DIM)
+    for i, fan in enumerate(fans):
+        yy = y + 2 + i * (2 if double else 1)
+        fresh = fan.get("fresh") is True
+        style = BAD if fan.get("healthy") is False else GOOD if fresh else WARN
+        fid = fan.get("fan_id", "?")
+        c.put(yy, xx, f" {fid!s:<2} {fmt(fan.get('rpm')):>6} {fmt(fan.get('pwm_pct'), '%'):>4}{' ' if fresh else '*'}", style)
+        available = inner - 19
+        bar_width = max(5, min(18, available // 3))
+        c.bar(yy, xx + 19, bar_width, fan.get("pwm_pct"), 100, style)
+        remaining = max(1, available - bar_width - 1)
+        c.spark(yy, xx + 20 + bar_width, history(collector, f"fan.{fid}.pwm_pct", span, remaining), remaining, 100, style)
+        if double:
+            c.put(yy + 1, xx, "    RPM", DIM)
+            c.spark(yy + 1, xx + 9, history(collector, f"fan.{fid}.rpm", span, inner - 9), inner - 9, 20000, CYAN)
+    if not fans:
+        c.put(y + 3, xx, "Waiting for cached iDRAC fan readings", WARN)
+    cool = snapshot.get("cooling", {})
+    c.put(y + height - 3, xx, f"Requested floor {fmt(cool.get('requested_floor_pct'), '%')} · measured age {age(cool.get('physical_age_seconds'))}"[:inner], NORMAL)
+    foot = f"{span // 60}m history · PWM 0–100%" + (" · RPM 0–20k" if double else "")
+    c.put(y + height - 2, xx, foot[:inner], DIM)
+    if len(snapshot.get("fans", [])) > 6:
+        c.put(y, x + width - 17, " first 6 fans ", WARN)
+
+
+def draw_cooling_rich(c, snapshot, collector, y, x, width, height, span):
+    c.box(y, x, width, height, "COOLING / CHASSIS")
+    cool, status, guard = snapshot.get("cooling", {}), snapshot.get("status", {}), snapshot.get("guard", {})
+    xx, inner = x + 2, width - 4
+    fresh = status.get("fresh") is True
+    verified = cool.get("controller_running") is True and cool.get("control_verified") is True and cool.get("setting_fresh") is True
+    fault, degraded = cool.get("fault_latched"), cool.get("control_degraded")
+    mode = "FAULT LATCHED" if fault else "STALE CONTROLLER STATUS" if not fresh else "CONTROL DEGRADED" if degraded else "DYNAMIC CONTROL" if verified else "CONTROL UNCONFIRMED"
+    c.put(y + 1, xx, mode[:inner], BAD if fault else GOOD if fresh and verified and not degraded else WARN)
+    guard_ok = guard.get("fresh") is True and cool.get("guard_healthy") is True
+    c.put(y + 2, xx, f"Guard {'HEALTHY' if guard_ok else 'UNCONFIRMED'} · {age(guard.get('age_seconds'))}"[:inner], GOOD if guard_ok else WARN)
+    route = cool.get("control_path") or "unknown"
+    c.put(y + 3, xx, f"iDRAC {route} · {'verified' if fresh and cool.get('setting_fresh') and cool.get('control_verified') else 'unconfirmed'} · floor {fmt(cool.get('requested_floor_pct'), '%')}"[:inner], NORMAL if fresh else WARN)
+    c.put(y + 4, xx, f"Idle range {fmt(cool.get('idle_min_pct'), '%')}–{fmt(cool.get('idle_max_pct'), '%')} · cutoff core/HBM {fmt(cool.get('cutoff_core_c'))}/{fmt(cool.get('cutoff_hbm_c'))}C"[:inner], NORMAL)
+    labels = []
+    for t in snapshot.get("temperatures", []):
+        label = {"inlet": "IN", "exhaust": "OUT", "cpu": "CPU"}.get(t.get("kind"), str(t.get("kind", "?")))
+        if t.get("kind") == "cpu":
+            label += str(t.get("index") or "")
+        labels.append(f"{label} {fmt(t.get('temperature_c'), 'C')}{'' if t.get('fresh') else '*'}")
+    if inner < 45:
+        c.put(y + 5, xx, "  ".join(labels[:2])[:inner], NORMAL)
+        c.put(y + 6, xx, "  ".join(labels[2:])[:inner], NORMAL)
+    else:
+        c.put(y + 5, xx, "  ".join(labels)[:inner], NORMAL)
+    if height >= 15:
+        gw = inner - 6
+        chart(c, y + 7, xx, inner, height - 8, "CHASSIS TEMPERATURE", [
+            ("INLET", history(collector, "temperature.inlet.0", span, gw), CYAN),
+            ("EXHAUST", history(collector, "temperature.exhaust.0", span, gw), BLUE),
+        ], 60, span, unit="°C")
+        c.put(y + 7, xx + 22, "IN", CYAN)
+        c.put(y + 7, xx + 26, "OUT", BLUE)
+    else:
+        c.put(y + 7, xx, f"Sensors {age(cool.get('physical_age_seconds'))}"[:inner], DIM)
+        c.put(y + 8, xx, "RPM uncalibrated; airflow not verified"[:inner], DIM)
+        if height >= 11:
+            c.put(y + 9, xx, "Fresh feedback is distinct from a fan request"[:inner], DIM)
+
+
+def render_dashboard(snapshot, collector=None, *, width=120, height=40, span=300, ascii_only=False, paused=False):
+    # Dense layouts remain useful in a conventional 80x24 SSH terminal.
+    if width < 70 or height < 44:
+        return render_compact(snapshot, collector, width=width, height=height, span=span, ascii_only=ascii_only, paused=paused)
+    c = Canvas(width, height, ascii_only)
+    system, status = snapshot.get("system", {}), snapshot.get("status", {})
+    c.put(0, 1, "cooltop", TITLE)
+    c.put(0, 10, "PAUSED" if paused else "● LIVE", WARN if paused else GOOD)
+    c.put(0, 20, "NVIDIA + iDRAC · READ ONLY", NORMAL)
+    timestamp = snapshot.get("sampled_unix")
+    stamp = dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%H:%M:%S %Z") if numeric(timestamp) else "--"
+    c.put(0, width - len(stamp) - 2, stamp, NORMAL)
+    host = clean(system.get("hostname") or "localhost")
+    line = f"{host[:26]} · up {duration(system.get('uptime_s'))} · {fmt(system.get('cpu_count'))} CPUs · load {fmt(system.get('load1'), digits=2)} {fmt(system.get('load5'), digits=2)} {fmt(system.get('load15'), digits=2)}"
+    c.put(1, 1, line[:width - 2], NORMAL)
+    half = width // 2
+    cpu, mem = system.get("cpu_pct"), system.get("mem_pct")
+    c.put(2, 1, f"CPU {fmt(cpu, '%'):>4}", CYAN)
+    c.bar(2, 11, half - 14, cpu, 100, CYAN)
+    used, total = system.get("mem_used_mb"), system.get("mem_total_mb")
+    ram = f"RAM {used / 1024:.1f}/{total / 1024:.1f} GiB" if numeric(used) and numeric(total) else "RAM --"
+    swap = system.get("swap_used_mb"), system.get("swap_total_mb")
+    if all(numeric(v) for v in swap):
+        ram += f" · swap {swap[0] / 1024:.1f}/{swap[1] / 1024:.1f}G"
+    c.put(2, half + 1, ram[:half - 3], PURPLE)
+    c.spark(3, 11, history(collector, "system.cpu_pct", span, half - 14), half - 14, 100, CYAN)
+    c.bar(3, half + 1, half - 3, mem, 100, PURPLE)
+    # A full-height design: the extra rows become chart resolution, not padding.
+    bottom_height = max(11, min(17, round(height * .28)))
+    footer_height, gpu_y = 3, 4
+    gpu_height = height - gpu_y - bottom_height - footer_height
+    widths = ((width - 3) // 2, width - 3 - (width - 3) // 2)
+    gpus = snapshot.get("gpus", [])[:2]
+    for i in range(2):
+        gpu = gpus[i] if i < len(gpus) else {"index": i, "name": "No telemetry"}
+        draw_gpu_rich(c, snapshot, collector, gpu, gpu_y, 1 if i == 0 else widths[0] + 2, widths[i], gpu_height, span)
+    bottom_y = gpu_y + gpu_height
+    draw_fans_rich(c, snapshot, collector, bottom_y, 1, widths[0], bottom_height, span)
+    draw_cooling_rich(c, snapshot, collector, bottom_y, widths[0] + 2, widths[1], bottom_height, span)
+    cool = snapshot.get("cooling", {})
+    state = status.get("state") or ("fresh" if status.get("fresh") else "unavailable")
+    reason = cool.get("error") or cool.get("reason") or status.get("error") or "Waiting for telemetry"
+    c.put(height - 3, 2, f"Status {state} · {age(status.get('age_seconds'))} · {reason}"[:width - 4], NORMAL if status.get("fresh") else WARN)
+    c.put(height - 2, 2, f"{span // 60}m window · newest at right · peak per bucket · * stale/unavailable · gaps mean no fresh observation"[:width - 4], DIM)
+    c.put(height - 1, 2, f"q quit  p pause  h help  +/- history [{span // 60}m]  r refresh", NORMAL)
+    if len(snapshot.get("gpus", [])) > 2:
+        c.put(height - 1, width - 24, "first 2 GPUs displayed", WARN)
+    return c
+
+
 def help_overlay(canvas):
     lines = [
         "cooltop · keyboard & readings", "",
@@ -319,6 +608,8 @@ def help_overlay(canvas):
         "A stale reading stays visible but is marked stale (* on sensors).",
         "Gaps in histories mean missing/stale data, not zero load.",
         "History begins when cooltop starts; no earlier samples invented.",
+        "Plots use peak per time bucket; known samples hold only within TTL.",
+        "Core cyan / HBM magenta; white points mark overlapping series.",
         "A requested fan floor is distinct from measured PWM/RPM.",
         "Spinning fans do not by themselves prove sufficient airflow.", "",
         "NVIDIA details: bounded queries for VRAM/name/power cap every 5s.",
@@ -349,8 +640,6 @@ def draw_curses(screen, canvas):
             attrs = curses.color_pair(style + 1) if curses.has_colors() else 0
             if style == TITLE:
                 attrs |= curses.A_BOLD
-            if style == DIM:
-                attrs |= curses.A_DIM
             try:
                 screen.addstr(y, start, text, attrs)
             except curses.error:
@@ -373,8 +662,10 @@ def run_curses(screen, collector, args):
             background = -1
         except curses.error:
             background = curses.COLOR_BLACK
-        colors = [curses.COLOR_WHITE, curses.COLOR_WHITE, curses.COLOR_CYAN, curses.COLOR_GREEN,
-                  curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN, curses.COLOR_BLUE]
+        colors = ([252, 250, 51, 84, 220, 203, 45, 214, 207, 242] if curses.COLORS >= 256 else
+                  [curses.COLOR_WHITE, curses.COLOR_WHITE, curses.COLOR_CYAN, curses.COLOR_GREEN,
+                   curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN, curses.COLOR_YELLOW,
+                   curses.COLOR_MAGENTA, curses.COLOR_WHITE])
         for i, color in enumerate(colors, 1):
             curses.init_pair(i, color, background)
     screen.keypad(True)
