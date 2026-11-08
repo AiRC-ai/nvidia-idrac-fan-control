@@ -1,0 +1,32 @@
+[Unit]
+Description=NVIDIA telemetry to iDRAC automatic fan floor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=nvidia-fan
+Group=nvidia-fan
+SupplementaryGroups=video
+RuntimeDirectory=nvidia-idrac-fan
+RuntimeDirectoryMode=0700
+StateDirectory=nvidia-idrac-fan
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/nvidia-idrac-fan/nvidia_idrac_fan.py --config /etc/nvidia-idrac-fan/config.json --apply
+ExecStopPost=/usr/bin/python3 /usr/local/lib/nvidia-idrac-fan/nvidia_idrac_fan.py --config /etc/nvidia-idrac-fan/config.json --apply --failsafe
+Restart=always
+RestartSec=5
+WatchdogSec=180
+TimeoutStartSec=90
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/nvidia-idrac-fan /run/nvidia-idrac-fan
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+config.json
+status.json
+*.pem
+*.key
+id_ed25519*
+known_hosts
+.DS_Store

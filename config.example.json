@@ -1,0 +1,32 @@
+{
+  "host": "idrac.example.net",
+  "user": "fancontrol",
+  "identity_file": "/etc/nvidia-idrac-fan/id_ed25519",
+  "known_hosts_file": "/etc/nvidia-idrac-fan/known_hosts",
+  "ssh_port": 22,
+  "expected_gpu_count": 2,
+  "require_memory_temperature": true,
+  "nvidia_smi": "/usr/bin/nvidia-smi",
+  "ssh": "/usr/bin/ssh",
+  "status_file": "/var/lib/nvidia-idrac-fan/status.json",
+  "lock_file": "/run/nvidia-idrac-fan/controller.lock",
+  "interval_seconds": 5,
+  "connect_timeout_seconds": 5,
+  "command_timeout_seconds": 15,
+  "policy": {
+    "idle_floor_pct": 55,
+    "active_floor_pct": 84,
+    "active_power_w": 80,
+    "active_utilization_pct": 15,
+    "core_target_c": 48,
+    "memory_target_c": 55,
+    "gain_pct_per_c": 2,
+    "core_full_speed_c": 75,
+    "memory_full_speed_c": 80,
+    "core_critical_c": 80,
+    "memory_critical_c": 85,
+    "down_step_pct": 5,
+    "cooldown_seconds": 60,
+    "down_hysteresis_pct": 3
+  }
+}
