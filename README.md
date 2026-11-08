@@ -4,6 +4,8 @@ A small Linux Python 3.10+ controller that reads local NVIDIA GPU core and suppo
 
 The policy is dynamic: idle GPUs can cool down even while a model remains loaded. Rising temperatures, including supported HBM readings, increase the requested fan floor. Firmware can always run the fans faster.
 
+For a terminal view of the recorded GPU, HBM, fan, and chassis measurements with rolling history graphs, see [cooltop](COOLTOP.md). The dashboard is a separate read-only observer.
+
 **Experimental hardware-control software. Use at your own risk.** Inadequate airflow, failed fans, an unreachable BMC, or a stopped controller can still cause overheating. This is not a certified thermal safety system. It does not stop workloads, change GPU power limits, or override hardware thermal protection.
 
 ## Compatibility and validation status
