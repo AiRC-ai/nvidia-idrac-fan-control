@@ -1,0 +1,30 @@
+[Unit]
+Description=Independent read-only NVIDIA cooling heartbeat monitor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=nvidia-guard
+Group=nvidia-guard
+RuntimeDirectory=nvidia-idrac-external-guard
+RuntimeDirectoryMode=0700
+StateDirectory=nvidia-idrac-external-guard
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/nvidia-idrac-fan/external_guard.py monitor --config /etc/nvidia-idrac-external-guard/config.json
+Restart=always
+RestartSec=5
+WatchdogSec=60
+TimeoutStartSec=45
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/nvidia-idrac-external-guard /run/nvidia-idrac-external-guard
+
+[Install]
+WantedBy=multi-user.target

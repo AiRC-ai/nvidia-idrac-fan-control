@@ -13,6 +13,14 @@
   "interval_seconds": 5,
   "connect_timeout_seconds": 5,
   "command_timeout_seconds": 15,
+  "diagnostics": {
+    "enabled": true,
+    "interval_seconds": 30,
+    "max_age_seconds": 90,
+    "expected_fan_ids": null,
+    "rpm_calibration_approved": false,
+    "rpm_minimums": {}
+  },
   "policy": {
     "idle_floor_pct": 55,
     "active_floor_pct": 84,

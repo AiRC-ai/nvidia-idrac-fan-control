@@ -1,0 +1,21 @@
+{
+  "guest_host": "gpu-guest.example.net",
+  "guest_user": "nvidia-fan",
+  "identity_file": "/etc/nvidia-idrac-external-guard/id_ed25519",
+  "known_hosts_file": "/etc/nvidia-idrac-external-guard/known_hosts",
+  "state_file": "/var/lib/nvidia-idrac-external-guard/state.json",
+  "status_file": "/var/lib/nvidia-idrac-external-guard/status.json",
+  "lock_file": "/run/nvidia-idrac-external-guard/monitor.lock",
+  "remote_python": "/usr/bin/python3",
+  "remote_helper": "/usr/local/lib/nvidia-idrac-fan/external_guard.py",
+  "remote_status_file": "/var/lib/nvidia-idrac-fan/status.json",
+  "remote_status_format": "generic",
+  "ssh": "/usr/bin/ssh",
+  "ssh_port": 22,
+  "interval_seconds": 10,
+  "command_timeout_seconds": 15,
+  "connect_timeout_seconds": 5,
+  "stale_after_seconds": 120,
+  "qualify_after_seconds": 30,
+  "recovery_samples": 3
+}

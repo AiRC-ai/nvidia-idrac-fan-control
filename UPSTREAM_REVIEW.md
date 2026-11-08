@@ -1,8 +1,23 @@
-# GitHub comparison and improvement plan
+# GitHub comparison and implemented improvements
 
 Reviewed November 7, 2026. This is a source review, not a benchmark or hardware compatibility certification. The links below pin the inspected revisions. No upstream controller was installed and no live thermal settings were changed for this research.
 
 The comparison concerns a Dell PowerEdge R730 / iDRAC8 with two Tesla V100 PCIe 32 GB GPUs in a Debian guest on ESXi 7. The useful next steps are stronger physical fan verification, clearer recovery diagnostics, and protection outside the GPU guest. A replacement fan curve alone would not address those gaps.
+
+## Version 0.2.0 implementation status
+
+The source review below led to these independently implemented additions:
+
+| Upstream design idea | Added here | Deliberate limit |
+|---|---|---|
+| Rack-fan-control metrics and fan-response checking | Individual fan RPM/PWM/health, explicit inventory, optional approved per-fan lower envelopes, cached JSON/Prometheus exporter | No chassis average, invented healthy baseline, automatic calibration, or assertion of sufficient airflow |
+| Environmental collection and stale-data handling | Optional inlet/exhaust/CPU readings; observation age starts before the bounded sensor request; source freshness expires independently of exporter freshness | Missing sensors remain unknown; ambient readings do not lower the GPU-selected demand |
+| External watcher | Linux/macOS read-only SSH heartbeat monitor with persistent alarms and recovery requiring strictly advancing samples from one controller instance | No external BMC writer; coordinated emergency ownership/fencing remains future work |
+| Explicit policy and failure states | Separate setting/PWM/RPM proofs, controller instance/sequence, graceful-stop heartbeat, diagnostic error isolation, failure/recovery tests | Monitoring cannot stop workloads, change power caps, or clear thermal faults |
+
+The original R730 installation also received same-response chassis diagnostics, per-GPU thermal headroom/trends, truthful request-start freshness, optional settled per-fan calibration assessment, and a narrow invalid-idle-configuration fallback to 100% with automatic recovery. These production-specific changes are separate from the reusable controller. Its workload protections and existing 80°C core / 85°C HBM cutoffs remain intact. No upstream fan-control source was copied.
+
+The recommendations below retain their original rationale. Per-fan calibration, an external cooling actuator, ambient prediction, throttle-reason collection, and sustained-load/reboot acceptance are not completed merely because the diagnostic scaffolding exists. See [VALIDATION.md](VALIDATION.md) and [EXTERNAL_GUARD.md](EXTERNAL_GUARD.md) for exact boundaries.
 
 ## Keep the two implementations distinct
 
@@ -34,7 +49,7 @@ Neither uses raw IPMI manual fan mode. Keep Dell's automatic thermal control and
 
 This review borrows design ideas, not source code. Check each project's license before incorporating implementation. Similar server names or a successful SSH connection do not establish equivalent fan commands, sensors or firmware behavior.
 
-## Proposed work, in order
+## Research recommendations and remaining work
 
 ### 1. Publish cooling proof and recovery state
 
@@ -53,7 +68,7 @@ Alert on a sustained fault and on recovery, rather than emitting a notification 
 
 ### 2. Verify each fan's physical response
 
-The original installation currently accepts six healthy fan records with at least 360 RPM and verifies their reported percentage against the requested floor. That detects stalls and missing records, but a slowly turning, non-stalled fan could pass. The generic package does not yet perform even this physical check.
+The original installation currently accepts six healthy fan records with at least 360 RPM and verifies their reported percentage against the requested floor. That detects stalls and missing records, but a slowly turning, non-stalled fan could pass. Version 0.2.0 adds optional per-fan diagnostics with a configured inventory; a positive calibrated RPM result still requires operator-approved bounds.
 
 Build an approved per-fan RPM envelope from known-good hardware at already-approved operating levels. Record fan identity/model, reported actual percentage, settling time and sample age. Match against actual duty where available: the requested setting is only a floor, and Dell may legitimately command more cooling. Use a conservative lower bound, not an exact-RPM equality or a chassis average. Never learn a progressively failing fan as the new normal.
 
@@ -91,6 +106,6 @@ Port the original installation's per-GPU trend and observation-gap tests into th
 
 ## Validation boundary
 
-All work above is proposed. The research itself changed no live fan curve, power cap, cutoff, model configuration or inference workload. No sustained-load, physical-link-disconnection or reboot test was performed for this comparison.
+The initial research changed no live configuration. Version 0.2.0 implements the observational features listed above; it does not establish universal hardware compatibility or complete every recommendation. No sustained-load, physical-link-disconnection or reboot test was performed for this comparison.
 
 Implement monitoring first, then validate physical fan response, then the external watcher, and finally measured ambient prediction. Keep offline fault-injection tests separate from hardware acceptance. Record the exact artifact, firmware, sensor capabilities and observed recovery at each stage. Consult [VALIDATION.md](VALIDATION.md) for this package's current evidence and remaining hardware gates.

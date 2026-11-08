@@ -10,4 +10,8 @@ Configuration and executable files must be protected against untrusted writes. T
 
 Loss of host power, the BMC, networking, NVIDIA telemetry, or the controller can prevent a fan-floor request from being applied. A read-back floor is not proof of actual airflow or cooling. Critical temperatures request maximum fans but do not stop workloads. Keep vendor thermal protection enabled and act on overheating independently.
 
+Optional physical diagnostics are observational. Fan PWM, measured RPM, a configured RPM envelope, and heatsink airflow are distinct evidence. A nonzero RPM or a successful floor-setting readback is not cooling acceptance. Do not publish raw sensor/SSH output or real calibration/deployment files without reviewing their contents.
+
+The cached `status_metrics.py` helper needs only read access to a private regular status file. It performs no hardware, subprocess or network operation; never give a metrics collector the controller's SSH key unnecessarily. It exports an allowlist of fixed/numeric labels and omits arbitrary errors, names, identifiers and paths. A collector that serves metrics over HTTP must be secured separately. Freshness alone is not health; alert on stopped, faulted, unverified or stale states.
+
 For a security concern, use the repository's private security advisory facility if available. Do not place secrets in a public issue. Include a minimal, synthetic reproduction and the affected version.

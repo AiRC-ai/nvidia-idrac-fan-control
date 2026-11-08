@@ -1,14 +1,29 @@
 # Validation status
 
-Reviewed 2026-11-08T04:10:51.115293+00:00.
+Version 0.2.0 source review and offline checks completed on 2026-11-08 UTC. Limited integration results below are separate from continuous controller acceptance.
 
-- Version: `0.1.0`.
-- Python offline suite: **38 tests passed** using Python 3.9.6.
-- Coverage: synthetic NVIDIA/RACADM parsing, mandatory/optional sensors, identity/count changes, thermal and activity demand, stepwise cooldown, control-loss maximum requests, recovery, strict SSH/configuration validation, path-alias rejection, atomic status, and successful/failed final maximum requests.
-- Independent offline source review accepted the fixes for status/lock/credential path aliasing, OpenSSH filename parsing, and final-shutdown exit status.
-- Source compilation and `--version` smoke check passed.
+- Version: `0.2.0`.
+- Combined Python offline suite: **108 tests passed** using Python 3.9.6: 38 existing controller tests, 29 physical-diagnostic/cached-exporter tests, and 41 external-monitor tests. Reproduce with `python3 -m unittest discover -s tests -v`.
+- Controller coverage: synthetic NVIDIA/RACADM parsing, mandatory/optional sensors, identity/count changes, thermal and activity demand, stepwise cooldown, control-loss maximum requests, recovery, strict SSH/configuration validation, path-alias rejection, atomic status, and successful/failed final maximum requests.
+- Observability coverage: actual RPM versus threshold columns, arbitrary fan counts, missing/duplicate/malformed/unknown sensor readings, stale or failed reads, slow-request observation age, explicit inventory, approved per-fan envelopes, uncalibrated/unsupported states, unique producer invocation IDs, and diagnostics failure preserving the existing control result. No universal fan count or sufficient-RPM constant is supplied.
+- Cached exporter coverage: generic and explicit production adapters, legacy readings without invented verification, increasing cached age and shorter source-TTL expiration, same-boot monotonic freshness across wall-clock changes, prior-boot/future/missing-monotonic rejection, finite numeric allowlists, private-data/label exclusion, invalid/duplicate JSON and non-regular file rejection, and CLI execution with subprocess/socket calls forbidden.
+- External-monitor coverage is documented in [EXTERNAL_GUARD.md](EXTERNAL_GUARD.md); it is an observer, not a second BMC writer.
+- Independent source review accepted the control/diagnostic separation, request-start observation ages, source TTL expiry, per-fan proof, strict heartbeat advancement, macOS cross-process clock, alarm-preserving state migration, path aliasing, OpenSSH filename parsing, and final-shutdown exit status.
+- Source compilation, `--version` (`0.2.0`), and cached-exporter `--help` smoke checks passed. The metrics module imports only standard-library argument, file, JSON, numeric and time utilities; it does not import the controller, subprocess or sockets.
 - Privacy scan found no private addresses, real deployment hostnames, user/workspace paths, credentials, actual GPU identifiers, or copied model/service configuration.
 
-The 38 offline tests contacted no hardware. A separate **read-only live probe** then passed on the R730/iDRAC8 through strict, key-authenticated SSH: two V100s, memory-temperature readings on both, advertised fan-floor limits 0–100%, PCI fan response enabled. It made no BMC writes and started no GPU workload. Private probe configuration is stored outside this repository.
+These offline tests contacted no hardware. A separate **version 0.1.0 read-only live probe** previously passed on the R730/iDRAC8 through strict, key-authenticated SSH: two V100s, memory-temperature readings on both, advertised fan-floor limits 0–100%, PCI fan response enabled. It made no BMC writes and started no GPU workload. This earlier probe is not acceptance of the new diagnostics/exporter or external monitor. Private probe configuration is stored outside this repository.
 
-**Not yet accepted:** continuous write/control behavior of this generic package, physical fan RPM/airflow, sustained-load and inlet-temperature margin, systemd execution, restart/reboot behavior, and compatibility beyond the documented policy-development environment. See the README's hardware acceptance checklist.
+## Limited live integration on the original installation
+
+On 2026-11-08 UTC, the original R730 controller's separate diagnostic enhancement passed 113 offline tests and was activated at a verified idle boundary. Independent read-only verification confirmed fresh GPU/guard status, all six fan records, restored authenticated model readiness, and unchanged 250 W limits on both V100s. After startup qualification the original dynamic controller returned to its 55% idle setting. No sustained GPU load or reboot test was started.
+
+The exact public `status_metrics.py` artifact was installed as a read-only consumer of the original controller's cached production-format status. Its private systemd timer refreshes JSON/Prometheus files every 15 seconds. Fresh temperatures, per-fan readings, and distinct setting/PWM/uncalibrated-RPM proof states were observed. This exercised the exporter adapter, not the generic controller's BMC actuator or sensor-collection loop.
+
+The exact public `external_guard.py` artifact was installed as a read-only Linux guest helper and a supervised macOS management-host monitor using Python 3.9.6 and existing strictly pinned guest-administration SSH. The persistent monitor reported healthy, fresh, advancing status. A separate private test configuration used a closed SSH port and a three-second qualification interval: an alarm qualified, persisted across separate monitor-process executions, and cleared only after three advancing healthy helper observations. The normal monitor configuration was unchanged. No BMC command or fan-setting write exists in this monitor; this was a controlled transport failure, not a real guest outage or physical network disconnection.
+
+That integration test exposed the macOS Python 3.9 process-relative `time.monotonic()` origin. The management-only clock was changed to system-wide `CLOCK_MONOTONIC`; old clock-state migration preserves a qualified alarm and resets incompatible timing/recovery state. The corrected cross-process live test passed, and the continuous Mac observer was relaunched and verified healthy. The Linux guest helper clock was unchanged.
+
+Private endpoints, identities, keys, source status, and receipts remain outside this repository. No separate restricted-account deployment, notification delivery, external BMC failover, calibrated airflow validation, or compatibility certification is implied.
+
+**Not yet accepted:** the new generic controller's sensor collector on live hardware or continuous BMC-write/control behavior, calibrated physical fan RPM/airflow, sustained-load and inlet-temperature margin, real guest/network/power failure, management-host/guest reboot, Linux external-monitor systemd execution, alert delivery, and compatibility beyond the documented environment. No external BMC actuator exists. See the README's hardware acceptance checklist.

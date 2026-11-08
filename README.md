@@ -8,7 +8,7 @@ The policy is dynamic: idle GPUs can cool down even while a model remains loaded
 
 ## Compatibility and validation status
 
-The underlying policy concepts were developed in a real **Dell PowerEdge R730 / iDRAC8**, with **two NVIDIA Tesla V100 PCIe 32 GB cards**, exposed to a **Debian GPU guest on ESXi 7**. This reusable package is a separate clean implementation. Its **38 offline tests pass**, and its **read-only capability probe passed on that R730**: both V100s and both memory-temperature sensors were detected, with an advertised 0–100% fan-floor range and PCI fan response enabled. The probe made no hardware-setting writes. **Continuous control, workload cooling, and systemd/reboot behavior of this generic package remain unvalidated.** Experience with the original installation is not acceptance of this artifact.
+The underlying policy concepts were developed in a real **Dell PowerEdge R730 / iDRAC8**, with **two NVIDIA Tesla V100 PCIe 32 GB cards**, exposed to a **Debian GPU guest on ESXi 7**. This reusable package is a separate clean implementation. Its offline controller, diagnostics, and cached-exporter tests pass; see [VALIDATION.md](VALIDATION.md) for the measured suite and acceptance boundaries. The **version 0.1.0 read-only capability probe passed on that R730**: both V100s and both memory-temperature sensors were detected, with an advertised 0–100% fan-floor range and PCI fan response enabled. That probe made no hardware-setting writes and does not validate the later 0.2.0 diagnostics. **Continuous control, workload cooling, and systemd/reboot behavior of this generic package remain unvalidated.** Experience with the original installation is not acceptance of this artifact.
 
 Other iDRAC generations, firmware revisions, GPU models, Linux distributions, and bare-metal deployments are untested. They may require different commands or may not support these controls. Do not assume compatibility because SSH works. The controller refuses writes when its required capability checks fail.
 
@@ -43,7 +43,7 @@ Polling and SSH are not real-time. Each external command has a timeout, and the 
 
 ### Important limits
 
-`control_verified=true` proves that RACADM acknowledged and read back the requested **floor**. It does not prove actual fan RPM, heatsink airflow, sensor calibration, thermal headroom, or safe sustained GPU operation. Validate those independently. Dell's automatic algorithm may keep fans above the requested floor; this program cannot force them lower.
+`control_verified=true` (also `floor_setting_verified=true`) proves the **floor setting** was read back. It does not prove fan RPM, heatsink airflow, sensor calibration, thermal headroom, or safe sustained GPU operation. The separate physical diagnostic fields below describe narrower, optional evidence. Dell's automatic algorithm may keep fans above the requested floor; this program cannot force them lower.
 
 100% is a requested setting, not a guarantee when SSH or the BMC fails. Hard power loss, kernel failure, `SIGKILL`, bad networking, or unavailable management access can prevent the final request. The last persistent floor can remain set. Keep Dell's automatic cooling and hardware protections enabled, and use independent monitoring. Never run another fan controller against the same BMC at the same time.
 
@@ -116,6 +116,41 @@ Status is written atomically to the configured `status_file` with mode 0600. It 
 
 The lock prevents multiple copies using **the same lock path on one Linux host**. It does not coordinate multiple guests or different administrators. Run only one owner for a BMC.
 
+## Optional physical diagnostics
+
+Version 0.2.0 reads `racadm getsensorinfo` after control action, at most once per configured diagnostic interval (30 seconds by default). The same response can provide per-fan RPM, reported PWM percentage and health, plus available inlet, exhaust and CPU temperature readings. It does not assume six fans or use thresholds from another server. Unsupported fields remain `null`; malformed, duplicate, missing or stale readings cannot establish a positive proof. A diagnostic read failure does not change the fan policy, stop workloads, or convert a successful floor-setting transaction into a control fault. The diagnostic command still has its normal bounded SSH timeout.
+
+The parser supports familiar iDRAC text rows such as `System Board Fan1 Ok 10440RPM ... 55%` and `CPU1 Temp Ok 44C ...`. Different formats may be unsupported. Raw output and arbitrary sensor names are not included in status.
+
+`physical_diagnostics` includes an observation timestamp, monotonic age, maximum permitted age, freshness, per-fan readings, temperature readings, and three distinct checks. Observation age starts before the sensor request, so a slow response cannot make old evidence look newly sampled:
+
+- `inventory_complete_verified`: all explicitly configured fan IDs were observed without malformed or duplicate fan rows. With automatic discovery alone, completeness is unknown and this check stays false.
+- `fan_pwm_verified`: all configured fans are healthy and report PWM at least as high as the verified floor. It stays `null` without a configured complete inventory, a floor-setting proof, or fresh supported readings.
+- `fan_rpm_verified`: every configured fan meets an explicitly approved, per-fan RPM envelope at its observed PWM. It stays `null` without calibration or below the calibrated range. Nonzero RPM only shows rotation; it is never treated as sufficient cooling.
+
+Set `diagnostics.expected_fan_ids` to the exact IDs independently confirmed on your server to enable whole-inventory checks. The example leaves it `null` and does not claim complete inventory. `max_age_seconds` must be at least `interval_seconds`.
+
+RPM calibration is optional and operator supplied. `rpm_minimums` maps each configured ID (as a string) to increasing `[PWM_percent, minimum_RPM]` points; it must cover exactly the configured IDs, use nondecreasing RPM minimums, and requires `rpm_calibration_approved=true`. At each observed PWM, the largest minimum for points at or below that PWM is used. No interpolation, automatic learning, or universal RPM minimum is supplied. Establish conservative acceptance envelopes with the correct fan hardware and sustained cooling tests before approving them. An RPM envelope proves neither heatsink airflow nor GPU thermal margin. Physical results are observational only and do not automatically alter control.
+
+Disable these reads with `diagnostics.enabled=false` if the format is unsupported or the extra management traffic is undesirable. Core/HBM safety telemetry and the required thermal-setting capability/readback checks remain active.
+
+## Cached status and Prometheus output
+
+`status_metrics.py` reads one existing local status file. It imports no fan-control module, executes no commands, opens no network connection, and never reads NVIDIA or contacts iDRAC. It can read this package's schema 1 and the explicitly supported production status shape (`utc`, `monotonic`, `gpus`, `requested_floor_pct`, and optional `cooling_diagnostics.schema=1`). Legacy production fan measurements can be displayed but do not acquire fabricated PWM/RPM verification.
+
+```bash
+python3 status_metrics.py --status-file /var/lib/nvidia-idrac-fan/status.json
+python3 status_metrics.py --status-file /var/lib/nvidia-idrac-fan/status.json --format json --max-age-seconds 90
+```
+
+Prometheus text is the default. Use a separate, reviewed node-exporter textfile collector or your monitoring agent to publish the output; this package opens no HTTP listener. Arrange private status-file read access without giving the collector SSH keys or NVIDIA device access. If saving output periodically, replace the `.prom` file atomically so scrapes cannot read partial content.
+
+Exit status is **0** for a fresh readable snapshot, **1** for a stale readable snapshot, and **2** for unavailable, malformed, or unsupported status. These codes describe freshness, not thermal health: monitor the `fault`, `controller_running`, floor, physical freshness, and verification metrics too. `*_verified_known=0` denotes an unknown physical proof; an omitted measurement is not zero. Cached measurements remain available with their age after they become stale, but positive verification is invalidated.
+
+On the same Linux boot, freshness uses the status monotonic sample time and current boot ID, so a wall-clock correction cannot make a stale sample fresh. A previous-boot snapshot is stale. Physical proof also expires at its source's `max_age_seconds`, even if the exporter's global maximum is longer. When boot metadata is absent, portable fallback uses wall time and rejects future timestamps; monitor clock synchronization if copying status between machines. `boot_id`, `sample_monotonic`, `cycle_sequence`, and a random per-invocation `producer_instance` are added to the private controller status for independent heartbeat monitoring. The invocation identity lets a monitor recognize a same-boot controller restart rather than confusing its restarted sequence with stale data. These fields describe controller status publication, not a new GPU measurement or physical fan read.
+
+Only fixed metric names, numeric GPU/fan indexes, fixed temperature categories and finite numeric values are exported. Hostnames, addresses, usernames, paths, boot/invocation IDs, GPU UUIDs, raw errors and free-form reason strings are excluded. Missing/invalid status returns only fixed availability/freshness values.
+
 ## Hardware acceptance checklist
 
 Before unattended operation, independently verify:
@@ -123,6 +158,8 @@ Before unattended operation, independently verify:
 - Probing succeeds and unsupported/disabled capabilities fail clearly.
 - Core and memory readings match trusted tools on every intended GPU; a missing sensor/device raises the floor.
 - Every accepted floor changes as expected and all physical fan RPMs/airflow remain adequate.
+- Diagnostic fan IDs match independently verified hardware; PWM is distinct from RPM, and any approved per-fan RPM envelope is appropriate at every intended duty.
+- Missing/stale diagnostic readings are shown as unknown and do not masquerade as fresh physical proof.
 - The vendor algorithm can increase fan speeds above the floor.
 - Both GPUs cool safely during sustained simultaneous load at the worst expected inlet temperature.
 - Telemetry loss, invalid responses, iDRAC connectivity loss and return, controller exit/restart, and host reboot produce the documented behavior.

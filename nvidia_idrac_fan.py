@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
 import stat
@@ -19,8 +20,9 @@ import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
+from physical_telemetry import DiagnosticError, DiagnosticsConfig, assess_snapshot, parse_chassis_sensors
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 THERMAL_OBJECT = "System.ThermalSettings"
 MINIMUM_OBJECT = THERMAL_OBJECT + ".MinimumFanSpeed"
 
@@ -114,6 +116,7 @@ class Config:
     command_timeout_seconds: int = 15
     nvidia_smi: str = "/usr/bin/nvidia-smi"
     ssh: str = "/usr/bin/ssh"
+    diagnostics: DiagnosticsConfig = dataclasses.field(default_factory=DiagnosticsConfig)
 
 
 def load_config(path: Path) -> Config:
@@ -123,6 +126,7 @@ def load_config(path: Path) -> Config:
             raise ConfigError("configuration must be a JSON object")
         raw = dict(raw)
         raw["policy"] = PolicyConfig(**raw.pop("policy", {}))
+        raw["diagnostics"] = DiagnosticsConfig(**raw.pop("diagnostics", {}))
         for name in ("identity_file", "known_hosts_file", "status_file", "lock_file"):
             raw[name] = Path(raw[name]).expanduser()
             if not raw[name].is_absolute():
@@ -131,6 +135,10 @@ def load_config(path: Path) -> Config:
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise ConfigError("cannot parse configuration; check required keys and types") from exc
     c.policy.validate()
+    try:
+        c.diagnostics.validate()
+    except DiagnosticError as exc:
+        raise ConfigError(str(exc)) from exc
     if not isinstance(c.host, str) or not isinstance(c.user, str):
         raise ConfigError("SSH host and user must be strings")
     try:
@@ -304,6 +312,9 @@ class IDRAC:
             raise ControlError("RACADM readback does not match the requested floor")
         return current
 
+    def read_sensors(self) -> dict:
+        return parse_chassis_sensors(self.command(["getsensorinfo"]))
+
 
 class Policy:
     def __init__(self, config: PolicyConfig):
@@ -355,6 +366,15 @@ class Controller:
         self.memory_available: set[str] = set()
         self.control_verified = False
         self.last_floor: int | None = None
+        self.floor_verified_time: float | None = None
+        self.floor_verified_monotonic: float | None = None
+        self.physical_snapshot: dict | None = None
+        self.physical_observed_time: float | None = None
+        self.physical_observed_monotonic: float | None = None
+        self.physical_attempt_monotonic: float | None = None
+        self.physical_error: str | None = None
+        self.cycle_sequence = 0
+        self.producer_instance = secrets.token_hex(32)
 
     def read_gpus(self):
         text = run_command([self.config.nvidia_smi, "-q", "-x"], self.config.command_timeout_seconds, TelemetryError)
@@ -368,11 +388,13 @@ class Controller:
         try:
             self.idrac.set_floor(100)
             self.last_floor, self.control_verified = 100, True
+            self.floor_verified_time, self.floor_verified_monotonic = time.time(), time.monotonic()
         except FanError:
             return False
         return True
 
     def step(self, now: float) -> dict:
+        self.cycle_sequence += 1
         samples = []
         try:
             samples = self.telemetry()
@@ -392,19 +414,63 @@ class Controller:
                 if settings.minimum_pct != desired or not self.control_verified:
                     self.idrac.set_floor(desired)
                 self.last_floor, self.control_verified = desired, True
+                self.floor_verified_time, self.floor_verified_monotonic = time.time(), time.monotonic()
             critical = reason == "critical-temperature-no-workload-stop"
+            self.refresh_diagnostics()
             return self.status(samples, desired, reason, critical)
         except FanError as exc:
             self.failsafe()  # Every failed cycle retries 100; no inference stop or process kill.
+            self.refresh_diagnostics()
             return self.status(samples, 100, type(exc).__name__ + ": " + str(exc), True)
 
+    def refresh_diagnostics(self):
+        """Read optional sensors after fan action. Failure never alters policy/control."""
+        c, now = self.config.diagnostics, time.monotonic()
+        if not c.enabled or self.physical_attempt_monotonic is not None and now - self.physical_attempt_monotonic < c.interval_seconds:
+            return
+        self.physical_attempt_monotonic = now
+        request_started_time = time.time()
+        try:
+            snapshot = self.idrac.read_sensors()
+        except (FanError, DiagnosticError, AttributeError):
+            # Never expose raw command errors or transform diagnostic loss into
+            # an actuation failure. Any old readings are retained as unverified.
+            self.physical_error = "diagnostic-read-unavailable"
+            return
+        self.physical_snapshot = snapshot
+        # Treat observation time conservatively as request start: RACADM may
+        # have sampled its sensors at any point during a slow response.
+        self.physical_observed_time, self.physical_observed_monotonic = request_started_time, now
+        self.physical_error = None
+
     def status(self, samples, desired, reason, fault, *, running=True):
-        return {"schema": 1, "time_unix": time.time(), "version": VERSION, "dry_run": not self.apply,
+        now = time.monotonic()
+        age = max(0, now - self.physical_observed_monotonic) if self.physical_observed_monotonic is not None else None
+        physical = assess_snapshot(self.physical_snapshot, self.config.diagnostics, age_seconds=age,
+                                   requested_floor=self.last_floor if self.control_verified else None,
+                                   last_read_ok=self.physical_error is None)
+        physical.update(observed_time_unix=self.physical_observed_time, error=self.physical_error,
+                        observational_only=True, airflow_proven=False)
+        return {"schema": 1, "time_unix": time.time(), "sample_monotonic": now, "boot_id": read_boot_id(),
+                "cycle_sequence": self.cycle_sequence, "version": VERSION, "dry_run": not self.apply,
+                "producer_instance": self.producer_instance,
                 "controller_running": running,
                 "requested_floor_pct": desired, "verified_floor_pct": self.last_floor if self.control_verified else None,
-                "control_verified": self.control_verified, "fault": fault, "reason": reason,
+                "control_verified": self.control_verified, "floor_setting_verified": self.control_verified,
+                "floor_setting_verified_time_unix": self.floor_verified_time if self.control_verified else None,
+                "floor_setting_age_seconds": max(0, now - self.floor_verified_monotonic) if self.control_verified and self.floor_verified_monotonic is not None else None,
+                "fan_pwm_verified": physical["fan_pwm_verified"], "fan_rpm_verified": physical["fan_rpm_verified"],
+                "physical_diagnostics": physical, "fault": fault, "reason": reason,
                 "gpus": [{"index_in_sample": i, "core_c": g.core_c, "memory_c": g.memory_c,
                           "power_w": g.power_w, "utilization_pct": g.utilization_pct} for i, g in enumerate(samples)]}
+
+
+def read_boot_id() -> str | None:
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+    return value if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value) else None
 
 
 def write_status(path: Path, value: dict):
@@ -460,8 +526,10 @@ def main(argv=None):
             controller = Controller(c, idrac, apply=args.apply)
             if args.probe:
                 samples = controller.read_gpus()
+                controller.refresh_diagnostics()
                 print(json.dumps({"schema": 1, "dry_run": True, "thermal_settings": dataclasses.asdict(settings),
-                                  "gpu_count": len(samples), "memory_temperature_available": [g.memory_c is not None for g in samples]}))
+                                  "gpu_count": len(samples), "memory_temperature_available": [g.memory_c is not None for g in samples],
+                                  "physical_diagnostics": controller.status(samples, 100, "probe", False)["physical_diagnostics"]}))
                 return 0
             if args.failsafe:
                 ok = controller.failsafe()
@@ -475,7 +543,7 @@ def main(argv=None):
                     watchdog_seconds = int(watchdog_usec) / 1_000_000
                 except ValueError as exc:
                     raise ConfigError("invalid systemd watchdog interval") from exc
-                if watchdog_seconds <= c.interval_seconds + 6 * c.command_timeout_seconds + 10:
+                if watchdog_seconds <= c.interval_seconds + 7 * c.command_timeout_seconds + 10:
                     raise ConfigError("systemd watchdog is too short for configured command timeouts")
             stop = threading.Event()
             for sig in (signal.SIGTERM, signal.SIGINT):
