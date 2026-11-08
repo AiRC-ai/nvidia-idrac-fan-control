@@ -138,6 +138,7 @@ No private network addresses, local user directories, actual hostnames, account 
 
 ## Sources
 
+- [GitHub comparison and improvement plan](UPSTREAM_REVIEW.md) — pinned source review, current gaps, proposed monitoring/RPM/redundancy work, and required validation.
 - [Dell iDRAC8: modifying thermal settings with RACADM](https://www.dell.com/support/manuals/en-uk/idrac8-lifecycle-controller-v2.75.75.75/idrac8_2.75.75.75_ug/modifying-thermal-settings-using-racadm?guid=guid-476e0462-fb31-4dac-be4a-3af3801ae556&lang=en-us) — supported settings, advertised limits, minimum-floor behavior, and PCI response.
 - [Dell iDRAC8: modifying thermal settings](https://www.dell.com/support/manuals/en-us/integrated-dell-remote-access-cntrllr-8-with-lifecycle-controller-v2.00.00.00/idrac8_ug_pub-v1/modifying-thermal-settings-using-idrac-web-interface?guid=guid-c1a01b25-ea28-407e-b60d-a5b469bf42d4&lang=en-us) — persistent settings and platform-dependent support.
 - [NVIDIA System Management Interface](https://docs.nvidia.com/deploy/nvidia-smi/) — XML telemetry, Celsius temperatures, power/utilization and device-dependent memory temperature support.
