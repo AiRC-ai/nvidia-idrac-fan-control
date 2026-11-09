@@ -16,11 +16,11 @@ import time
 
 from cooltop_data import Collector
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_STATUS = "/var/lib/airc-gpu-fan-watchdog/status.json"
 DEFAULT_GUARD = "/run/airc-gpu-thermal-guard/guard.json"
 SPANS = (60, 300, 900)
-NORMAL, DIM, TITLE, GOOD, WARN, BAD, CYAN, BLUE, PURPLE, GRID = range(10)
+NORMAL, DIM, TITLE, GOOD, WARN, BAD, CYAN, BLUE, PURPLE, GRID, HEADER = range(11)
 
 
 def clean(value):
@@ -34,6 +34,24 @@ def numeric(value):
 
 def fmt(value, unit="", digits=0):
     return f"{value:.{digits}f}{unit}" if numeric(value) else "--"
+
+
+def percent(value):
+    return fmt(value, "%", digits=1 if numeric(value) and 0 < abs(value) < 1 else 0)
+
+
+def policy_fmt(snapshot, value, unit=""):
+    """Controller policy is current only while its source status is fresh."""
+    return fmt(value, unit) + ("" if snapshot.get("status", {}).get("fresh") is True else "*")
+
+
+def semantic_temperature_style(value, cutoff, normal):
+    if numeric(value) and numeric(cutoff):
+        if value >= cutoff:
+            return BAD
+        if value >= cutoff - 10:
+            return WARN
+    return normal
 
 
 def duration(value):
@@ -90,16 +108,26 @@ class Canvas:
         for yy, xx, char in ((y, x, tl), (y, x + width - 1, tr), (y + height - 1, x, bl), (y + height - 1, x + width - 1, br)):
             self.put(yy, xx, char, style)
         if title:
-            self.put(y, x + 2, f" {title} "[:max(0, width - 4)], TITLE)
+            self.put(y, x + 1, " " * (width - 2), HEADER)
+            self.put(y, x + 2, f" {title} "[:max(0, width - 4)], HEADER)
 
     def bar(self, y, x, width, value, maximum=100, style=GOOD):
         if width < 1:
             return
         full = "#" if self.ascii else "▰"
         empty = "." if self.ascii else "░"
-        n = round(width * max(0, min(1, value / maximum))) if numeric(value) and numeric(maximum) and maximum > 0 else 0
+        amount = width * max(0, min(1, value / maximum)) if numeric(value) and numeric(maximum) and maximum > 0 else 0
+        n = int(amount)
+        partial = round((amount - n) * 8)
+        if amount > 0 and n == 0 and partial == 0:
+            partial = 1
+        if partial >= 8:
+            n, partial = min(width, n + 1), 0
         self.put(y, x, full * n, style)
-        self.put(y, x + n, empty * (width - n), DIM)
+        if partial and n < width:
+            self.put(y, x + n, "+" if self.ascii else " ▏▎▍▌▋▊▉"[partial], style)
+            n += 1
+        self.put(y, x + n, empty * (width - n), GRID)
 
     def spark(self, y, x, values, width, maximum, style=CYAN):
         if width <= 0:
@@ -118,12 +146,14 @@ class Canvas:
         return "\n".join("".join(c for c, _ in row).rstrip() for row in self.cells).rstrip() + "\n"
 
 
-def history(collector, key, span, width):
+def history(collector, key, span, width, aggregation="max"):
     if not collector:
         return []
     try:
-        return collector.history(key, seconds=span, width=max(1, width), aggregation="max")
+        return collector.history(key, seconds=span, width=max(1, width), aggregation=aggregation)
     except TypeError:
+        if aggregation != "max":
+            return []  # A legacy peak-only provider cannot establish a minimum.
         return collector.history(key, seconds=span, width=max(1, width))
 
 
@@ -134,11 +164,12 @@ def axis_time(seconds):
     return f"-{int(seconds)}s"
 
 
-def chart(canvas, y, x, width, height, title, series, maximum, span, *, minimum=0, unit="", area=False):
+def chart(canvas, y, x, width, height, title, series, maximum, span, *, minimum=0, unit="", area=False, references=()):
     """Scaled multirow history chart. Series are (label, values, style) tuples."""
     if height < 4 or width < 18:
         return
-    canvas.put(y, x, title[:width], TITLE)
+    title_width = max(0, width - len(unit) - 2) if unit else width
+    canvas.put(y, x, title[:title_width], TITLE)
     label_width = 6
     plot_x, plot_y = x + label_width, y + 1
     plot_w, plot_h = width - label_width, height - 2
@@ -160,6 +191,17 @@ def chart(canvas, y, x, width, height, title, series, maximum, span, *, minimum=
             canvas.rule(plot_y + row, plot_x, plot_w, GRID)
         else:
             canvas.put(plot_y + row, plot_x - 1, "|" if canvas.ascii else "│", GRID)
+    reference_rows = {}
+    for reference in references:
+        if numeric(reference) and low <= reference <= high:
+            reference_row = (round((high - reference) / (high - low) * (plot_h * 4 - 1)) // 4
+                             if not canvas.ascii and not area else plot_h - 1 - round((reference - low) / (high - low) * (plot_h - 1)))
+            reference_rows.setdefault(reference_row, []).append(reference)
+    for reference_row, values in reference_rows.items():
+        for col in range(0, plot_w, 3):
+            canvas.put(plot_y + reference_row, plot_x + col, "." if canvas.ascii else "·", WARN)
+        label = "/".join(fmt(value) for value in values)
+        canvas.put(plot_y + reference_row, plot_x + max(0, plot_w - len(label)), label, WARN)
     have_data = False
     occupied = {}
     for label, values, style in series:
@@ -238,7 +280,7 @@ def gpu_panel(canvas, snapshot, collector, gpu, y, x, width, height, span):
     util = gpu.get("util_pct")
     power = gpu.get("power_w")
     limit = gpu.get("power_limit_w")
-    canvas.put(y + 3, xx, f"LOAD {fmt(util, '%')}{'' if stats_fresh else '*'}", CYAN if stats_fresh else DIM)
+    canvas.put(y + 3, xx, f"LOAD {percent(util)}{'' if stats_fresh else '*'}", CYAN if stats_fresh else DIM)
     power_text = f"{fmt(power, 'W')}{'' if stats_fresh else '*'} / {fmt(limit, 'W')}"
     canvas.put(y + 3, xx + half, power_text, BLUE if stats_fresh else DIM)
     canvas.bar(y + 4, xx, max(1, half - 2), util, 100, CYAN if stats_fresh else DIM)
@@ -312,10 +354,10 @@ def draw_fans(canvas, snapshot, collector, y, x, width, height, span, compact=Fa
     if not fans:
         canvas.put(y + 2, xx, "No chassis readings available"[:inner], WARN)
     if height >= 11:
-        pwm = [f.get("pwm_pct") for f in fans if numeric(f.get("pwm_pct"))]
+        pwm = [f.get("pwm_pct") for f in fans if f.get("fresh") is True and numeric(f.get("pwm_pct"))]
         min_pwm, max_pwm = (min(pwm), max(pwm)) if pwm else (None, None)
-        info = f"Actual PWM {fmt(min_pwm, '%')}–{fmt(max_pwm, '%')} · request {fmt(snapshot.get('cooling', {}).get('requested_floor_pct'), '%')}"
-        canvas.put(y + height - 3, xx, info[:inner], DIM)
+        info = f"Actual PWM {fmt(min_pwm, '%')}–{fmt(max_pwm, '%')} · request {policy_fmt(snapshot, snapshot.get('cooling', {}).get('requested_floor_pct'), '%')}"
+        canvas.put(y + height - 3, xx, info[:inner], DIM if snapshot.get("status", {}).get("fresh") is True else WARN)
         canvas.put(y + height - 2, xx, ("RPM verified; airflow not verified" if snapshot.get("cooling", {}).get("fan_rpm_verified") else "RPM uncalibrated; airflow not verified")[:inner], DIM)
 
 
@@ -333,9 +375,9 @@ def draw_cooling(canvas, snapshot, y, x, width, height):
     canvas.put(y + 2, xx, f"Guard {'HEALTHY' if guard_ok else 'UNCONFIRMED'} · {age(guard.get('age_seconds'))}"[:inner], GOOD if guard_ok else WARN)
     route = cool.get("control_path") or "unknown"
     canvas.put(y + 3, xx, f"iDRAC route {route} · {'verified' if status_fresh and cool.get('setting_fresh') and cool.get('control_verified') else 'unverified'}"[:inner], NORMAL if cool.get("setting_fresh") else WARN)
-    canvas.put(y + 4, xx, f"Floor {fmt(cool.get('requested_floor_pct'), '%')} · idle {fmt(cool.get('idle_min_pct'), '%')}–{fmt(cool.get('idle_max_pct'), '%')}"[:inner], NORMAL)
+    canvas.put(y + 4, xx, f"Floor {policy_fmt(snapshot, cool.get('requested_floor_pct'), '%')} · idle {policy_fmt(snapshot, cool.get('idle_min_pct'), '%')}–{policy_fmt(snapshot, cool.get('idle_max_pct'), '%')}"[:inner], NORMAL if status_fresh else WARN)
     if height >= 11:
-        canvas.put(y + 5, xx, f"Thermal cutoffs core {fmt(cool.get('cutoff_core_c'), 'C')} / HBM {fmt(cool.get('cutoff_hbm_c'), 'C')}"[:inner], DIM)
+        canvas.put(y + 5, xx, f"Thermal cutoffs core {policy_fmt(snapshot, cool.get('cutoff_core_c'), 'C')} / HBM {policy_fmt(snapshot, cool.get('cutoff_hbm_c'), 'C')}"[:inner], DIM if status_fresh else WARN)
         canvas.rule(y + 6, xx, inner)
         canvas.put(y + 7, xx, "CHASSIS TEMPERATURES", TITLE)
         temps = snapshot.get("temperatures", [])
@@ -436,7 +478,7 @@ def draw_gpu_rich(c, snapshot, collector, gpu, y, x, width, height, span):
     for offset, label, value, fresh, style in (
         (0, "CORE", fmt(core, "°C"), core_fresh, temperature_style(core, cutoff_core)),
         (third, "HBM", fmt(hbm, "°C"), hbm_fresh, temperature_style(hbm, cutoff_hbm)),
-        (third * 2, "LOAD", fmt(gpu.get("util_pct"), "%"), stats_fresh, CYAN),
+        (third * 2, "LOAD", percent(gpu.get("util_pct")), stats_fresh, CYAN),
     ):
         c.put(y + 1, xx + offset, f"{label} {value}{'' if fresh else '*'}", style if fresh else WARN)
     limit, power = gpu.get("power_limit_w"), gpu.get("power_w")
@@ -468,7 +510,7 @@ def draw_gpu_rich(c, snapshot, collector, gpu, y, x, width, height, span):
     c.put(graph_y, xx + 14, "CORE", CYAN)
     c.put(graph_y, xx + 20, "HBM", PURPLE)
     if inner >= 60 and numeric(cool.get("cutoff_core_c")) and numeric(cool.get("cutoff_hbm_c")):
-        c.put(graph_y, xx + 26, f"cutoff {fmt(cutoff_core)}/{fmt(cutoff_hbm)}C", DIM)
+        c.put(graph_y, xx + 26, f"cutoff {policy_fmt(snapshot, cutoff_core)}/{policy_fmt(snapshot, cutoff_hbm)}C", DIM if snapshot.get("status", {}).get("fresh") is True else WARN)
     graph_y += heights[0]
     util_hist = history(collector, f"gpu.{idx}.util_pct", span, graph_width)
     chart(c, graph_y, xx, inner, heights[1], "GPU UTILIZATION", [("LOAD", util_hist, CYAN)], 100, span, unit="%", area=True)
@@ -500,7 +542,7 @@ def draw_fans_rich(c, snapshot, collector, y, x, width, height, span):
     if not fans:
         c.put(y + 3, xx, "Waiting for cached iDRAC fan readings", WARN)
     cool = snapshot.get("cooling", {})
-    c.put(y + height - 3, xx, f"Requested floor {fmt(cool.get('requested_floor_pct'), '%')} · measured age {age(cool.get('physical_age_seconds'))}"[:inner], NORMAL)
+    c.put(y + height - 3, xx, f"Requested floor {policy_fmt(snapshot, cool.get('requested_floor_pct'), '%')} · measured age {age(cool.get('physical_age_seconds'))}"[:inner], NORMAL if snapshot.get("status", {}).get("fresh") is True else WARN)
     foot = f"{span // 60}m history · PWM 0–100%" + (" · RPM 0–20k" if double else "")
     c.put(y + height - 2, xx, foot[:inner], DIM)
     if len(snapshot.get("fans", [])) > 6:
@@ -519,8 +561,8 @@ def draw_cooling_rich(c, snapshot, collector, y, x, width, height, span):
     guard_ok = guard.get("fresh") is True and cool.get("guard_healthy") is True
     c.put(y + 2, xx, f"Guard {'HEALTHY' if guard_ok else 'UNCONFIRMED'} · {age(guard.get('age_seconds'))}"[:inner], GOOD if guard_ok else WARN)
     route = cool.get("control_path") or "unknown"
-    c.put(y + 3, xx, f"iDRAC {route} · {'verified' if fresh and cool.get('setting_fresh') and cool.get('control_verified') else 'unconfirmed'} · floor {fmt(cool.get('requested_floor_pct'), '%')}"[:inner], NORMAL if fresh else WARN)
-    c.put(y + 4, xx, f"Idle range {fmt(cool.get('idle_min_pct'), '%')}–{fmt(cool.get('idle_max_pct'), '%')} · cutoff core/HBM {fmt(cool.get('cutoff_core_c'))}/{fmt(cool.get('cutoff_hbm_c'))}C"[:inner], NORMAL)
+    c.put(y + 3, xx, f"iDRAC {route} · {'verified' if fresh and cool.get('setting_fresh') and cool.get('control_verified') else 'unconfirmed'} · floor {policy_fmt(snapshot, cool.get('requested_floor_pct'), '%')}"[:inner], NORMAL if fresh else WARN)
+    c.put(y + 4, xx, f"Idle range {policy_fmt(snapshot, cool.get('idle_min_pct'), '%')}–{policy_fmt(snapshot, cool.get('idle_max_pct'), '%')} · cutoff core/HBM {policy_fmt(snapshot, cool.get('cutoff_core_c'))}/{policy_fmt(snapshot, cool.get('cutoff_hbm_c'))}C"[:inner], NORMAL if fresh else WARN)
     labels = []
     for t in snapshot.get("temperatures", []):
         label = {"inlet": "IN", "exhaust": "OUT", "cpu": "CPU"}.get(t.get("kind"), str(t.get("kind", "?")))
@@ -547,7 +589,7 @@ def draw_cooling_rich(c, snapshot, collector, y, x, width, height, span):
             c.put(y + 9, xx, "Fresh feedback is distinct from a fan request"[:inner], DIM)
 
 
-def render_dashboard(snapshot, collector=None, *, width=120, height=40, span=300, ascii_only=False, paused=False):
+def render_detail_dashboard(snapshot, collector=None, *, width=120, height=40, span=300, ascii_only=False, paused=False):
     # Dense layouts remain useful in a conventional 80x24 SSH terminal.
     if width < 70 or height < 44:
         return render_compact(snapshot, collector, width=width, height=height, span=span, ascii_only=ascii_only, paused=paused)
@@ -597,10 +639,396 @@ def render_dashboard(snapshot, collector=None, *, width=120, height=40, span=300
     return c
 
 
+SEGMENTS = {
+    "0": ("┏━┓", "┃ ┃", "┗━┛"), "1": (" ╻ ", " ┃ ", " ╹ "),
+    "2": ("━━┓", "┏━┛", "┗━━"), "3": ("━━┓", " ━┫", "━━┛"),
+    "4": ("╻ ╻", "┗━┫", "  ╹"), "5": ("┏━━", "┗━┓", "━━┛"),
+    "6": ("┏━━", "┣━┓", "┗━┛"), "7": ("━━┓", "  ┃", "  ╹"),
+    "8": ("┏━┓", "┣━┫", "┗━┛"), "9": ("┏━┓", "┗━┫", "━━┛"),
+    "-": ("   ", "━━━", "   "),
+}
+ASCII_SEGMENTS = {
+    "0": (" _ ", "| |", "|_|"), "1": ("   ", "  |", "  |"),
+    "2": (" _ ", " _|", "|_ "), "3": (" _ ", " _|", " _|"),
+    "4": ("   ", "|_|", "  |"), "5": (" _ ", "|_ ", " _|"),
+    "6": (" _ ", "|_ ", "|_|"), "7": (" _ ", "  |", "  |"),
+    "8": (" _ ", "|_|", "|_|"), "9": (" _ ", "|_|", " _|"),
+    "-": ("   ", "---", "   "),
+}
+
+
+def big_number(c, y, x, value, style):
+    text = fmt(value) if numeric(value) else "--"
+    font = ASCII_SEGMENTS if c.ascii else SEGMENTS
+    for col, digit in enumerate(text):
+        for row, fragment in enumerate(font.get(digit, font["-"])):
+            c.put(y + row, x + col * 4, fragment, style)
+    c.put(y + 2, x + len(text) * 4, "C", style)
+
+
+def window_range(collector, key, span, width=80):
+    lows = [v for v in history(collector, key, span, width, aggregation="min") if numeric(v)]
+    highs = [v for v in history(collector, key, span, width, aggregation="max") if numeric(v)]
+    return (min(lows), max(highs)) if lows and highs else (None, None)
+
+
+def range_label(bounds, unit=""):
+    return f"{fmt(bounds[0])}–{fmt(bounds[1], unit)}" if all(numeric(v) for v in bounds) else "--"
+
+
+def paired_history(collector, first_key, second_key, span, width):
+    # Each time bucket gets two adjacent terminal cells: both semantic colors
+    # remain visible even when core and HBM have exactly the same value.
+    bins = max(1, width // 2)
+    first = history(collector, first_key, span, bins)
+    second = history(collector, second_key, span, bins)
+    first = [None] * max(0, bins - len(first)) + list(first)[-bins:]
+    second = [None] * max(0, bins - len(second)) + list(second)[-bins:]
+    a, b = [], []
+    for av, bv in zip(first, second):
+        a.extend((av, None))
+        b.extend((None, bv))
+    return a, b
+
+
+def shared_thermal_scale(snapshot, collector, span):
+    lows, highs = [], []
+    for gpu in snapshot.get("gpus", [])[:2]:
+        idx = gpu.get("index")
+        for key, fresh_key in (("core_c", "core_fresh"), ("hbm_c", "hbm_fresh")):
+            lo, hi = window_range(collector, f"gpu.{idx}.{key}", span)
+            if numeric(lo):
+                lows.append(lo)
+            if numeric(hi):
+                highs.append(hi)
+            if gpu.get(fresh_key, gpu.get("core_fresh")) is True and numeric(gpu.get(key)):
+                lows.append(gpu[key])
+                highs.append(gpu[key])
+    if not lows:
+        return 0, 100
+    cool = snapshot.get("cooling", {})
+    if snapshot.get("status", {}).get("fresh") is True:
+        highs.extend(v for v in (cool.get("cutoff_core_c"), cool.get("cutoff_hbm_c")) if numeric(v))
+    low = max(0, math.floor((min(lows) - 5) / 10) * 10)
+    return low, max(low + 30, math.ceil((max(highs) + 5) / 10) * 10)
+
+
+def gpu_summary(c, snapshot, collector, gpu, y, x, width, height, span):
+    idx = gpu.get("index", "?")
+    c.box(y, x, width, height, f"GPU {idx} · {clean(gpu.get('name') or 'NVIDIA GPU')[:width - 15]}")
+    xx, inner, half = x + 2, width - 4, (width - 4) // 2
+    for offset, key, label, style, fresh in (
+        (0, "core_c", "CORE", CYAN, gpu.get("core_fresh") is True),
+        (half, "hbm_c", "HBM", PURPLE, gpu.get("hbm_fresh", gpu.get("core_fresh")) is True),
+    ):
+        value = gpu.get(key)
+        bounds = window_range(collector, f"gpu.{idx}.{key}", span)
+        cutoff = snapshot.get("cooling", {}).get("cutoff_core_c" if key == "core_c" else "cutoff_hbm_c")
+        style = semantic_temperature_style(value, cutoff, style)
+        c.put(y + 1, xx + offset, f"{label} {fmt(value, '°C')}{'' if fresh else '*'}", style if fresh else WARN)
+        big_number(c, y + 2, xx + offset + 1, value, style if fresh else WARN)
+        c.put(y + 5, xx + offset, f"{span // 60}m {range_label(bounds, 'C')}"[:half - 1], DIM)
+    stats_fresh, details_fresh = gpu.get("stats_fresh") is True, gpu.get("details_fresh") is True
+    util, power, cap = gpu.get("util_pct"), gpu.get("power_w"), gpu.get("power_limit_w")
+    cap_known = details_fresh and numeric(cap) and cap > 0
+    for row, label, value, maximum, style in (
+        (6, f"LOAD {percent(util)}{'' if stats_fresh else '*'}", util, 100, CYAN),
+        (7, f"POWER {fmt(power, 'W')}{'' if stats_fresh else '*'}", power if cap_known else None, cap if cap_known else 100, BLUE),
+    ):
+        c.put(y + row, xx, label, style if stats_fresh else WARN)
+        start = min(17, inner // 2)
+        bar_fresh = stats_fresh and (row != 7 or cap_known)
+        c.bar(y + row, xx + start, inner - start, value, maximum, style if bar_fresh else WARN)
+    used, total = gpu.get("memory_used_mb"), gpu.get("memory_total_mb")
+    vram = f"VRAM {used / 1024:.1f}/{total / 1024:.1f}GiB" if numeric(used) and numeric(total) else "VRAM --"
+    vram += "" if details_fresh else "*"
+    c.put(y + 8, xx, vram, PURPLE if details_fresh else WARN)
+    start = min(inner - 4, len(vram) + 2)
+    c.bar(y + 8, xx + start, inner - start, used, total, PURPLE if details_fresh else WARN)
+    c.put(y + 9, xx, f"CAP {fmt(cap, 'W')}{'' if details_fresh else '*'} · SM {fmt(gpu.get('sm_clock_mhz'), 'MHz')} · HBM {fmt(gpu.get('memory_clock_mhz'), 'MHz')}"[:inner], NORMAL if details_fresh else WARN)
+    c.put(y + 10, xx, f"Temps {age(gpu.get('core_age_seconds'))} · load {age(gpu.get('stats_age_seconds'))}"[:inner], DIM)
+    if height > 12:
+        cool = snapshot.get("cooling", {})
+        margins = []
+        for key, cutoff, fresh_key in (("core_c", "cutoff_core_c", "core_fresh"), ("hbm_c", "cutoff_hbm_c", "hbm_fresh")):
+            temp, cut = gpu.get(key), cool.get(cutoff)
+            margins.append(cut - temp if gpu.get(fresh_key, gpu.get("core_fresh")) is True and numeric(temp) and numeric(cut) else None)
+        c.put(y + 11, xx, f"To guard cutoff {policy_fmt(snapshot, margins[0])}/{policy_fmt(snapshot, margins[1])}C"[:inner], DIM if snapshot.get("status", {}).get("fresh") is True else WARN)
+
+
+def cooling_summary(c, snapshot, y, x, width, height):
+    c.box(y, x, width, height, "COOLING · control & protection")
+    xx, inner = x + 2, width - 4
+    status, guard, cool = snapshot.get("status", {}), snapshot.get("guard", {}), snapshot.get("cooling", {})
+    fresh, fault = status.get("fresh") is True, cool.get("fault_latched") is True
+    verified = cool.get("controller_running") is True and cool.get("control_verified") is True and cool.get("setting_fresh") is True
+    mode = "FAULT LATCHED" if fault else "STALE CONTROLLER STATUS" if not fresh else "CONTROL DEGRADED" if cool.get("control_degraded") else "DYNAMIC CONTROL" if verified else "CONTROL UNCONFIRMED"
+    c.put(y + 1, xx, mode[:inner], BAD if fault else GOOD if fresh and verified and not cool.get("control_degraded") else WARN)
+    guard_ok = guard.get("fresh") is True and cool.get("guard_healthy") is True
+    c.put(y + 2, xx, f"Guard {'HEALTHY' if guard_ok else 'UNCONFIRMED'} · {age(guard.get('age_seconds'))}"[:inner], GOOD if guard_ok else WARN)
+    fans = snapshot.get("fans", [])[:6]
+    fresh_fans = [f for f in fans if f.get("fresh") is True]
+    pwms = [f["pwm_pct"] for f in fresh_fans if numeric(f.get("pwm_pct"))]
+    rpms = [f["rpm"] for f in fresh_fans if numeric(f.get("rpm"))]
+    c.put(y + 3, xx, f"FAN FEEDBACK {len(fresh_fans)}/{len(fans)} fresh"[:inner], NORMAL)
+    c.put(y + 4, xx, f"Actual PWM {range_label((min(pwms), max(pwms)), '%') if pwms else '--'}"[:inner], NORMAL if pwms else WARN)
+    c.put(y + 5, xx, f"Actual RPM {range_label((min(rpms), max(rpms))) if rpms else '--'}"[:inner], NORMAL if rpms else WARN)
+    c.put(y + 6, xx, f"FLOOR REQ {policy_fmt(snapshot, cool.get('requested_floor_pct'), '%')} · {cool.get('control_path') or 'route unknown'}"[:inner], NORMAL if fresh else WARN)
+    c.put(y + 7, xx, f"Guard cutoff core {policy_fmt(snapshot, cool.get('cutoff_core_c'), 'C')} / HBM {policy_fmt(snapshot, cool.get('cutoff_hbm_c'), 'C')}"[:inner], DIM if fresh else WARN)
+    c.put(y + 8, xx, f"Idle band {policy_fmt(snapshot, cool.get('idle_min_pct'), '%')}–{policy_fmt(snapshot, cool.get('idle_max_pct'), '%')}"[:inner], DIM if fresh else WARN)
+    c.put(y + 9, xx, f"iDRAC sensors {age(cool.get('physical_age_seconds'))}"[:inner], DIM)
+    c.put(y + 10, xx, "Rotation does not prove airflow"[:inner], DIM)
+    if height > 12:
+        c.put(y + 11, xx, str(cool.get("reason") or status.get("error") or "Waiting for telemetry")[:inner], DIM)
+
+
+def thermal_overview(c, snapshot, collector, gpu, y, x, width, height, span, scale):
+    idx = gpu.get("index", "?")
+    c.box(y, x, width, height, f"GPU {idx} · THERMAL HISTORY")
+    xx, inner = x + 2, width - 4
+    core_bounds = window_range(collector, f"gpu.{idx}.core_c", span)
+    hbm_bounds = window_range(collector, f"gpu.{idx}.hbm_c", span)
+    cool = snapshot.get("cooling", {})
+    core_style = semantic_temperature_style(gpu.get("core_c"), cool.get("cutoff_core_c"), CYAN) if gpu.get("core_fresh") else WARN
+    hbm_style = semantic_temperature_style(gpu.get("hbm_c"), cool.get("cutoff_hbm_c"), PURPLE) if gpu.get("hbm_fresh", gpu.get("core_fresh")) else WARN
+    c.put(y + 1, xx, f"CORE {fmt(gpu.get('core_c'), 'C')}{'' if gpu.get('core_fresh') else '*'} · range {range_label(core_bounds, 'C')}"[:inner], core_style)
+    c.put(y + 2, xx, f"HBM  {fmt(gpu.get('hbm_c'), 'C')}{'' if gpu.get('hbm_fresh', gpu.get('core_fresh')) else '*'} · range {range_label(hbm_bounds, 'C')}"[:inner], hbm_style)
+    low, high = scale
+    cool = snapshot.get("cooling", {})
+    a, b = paired_history(collector, f"gpu.{idx}.core_c", f"gpu.{idx}.hbm_c", span, inner - 6)
+    policy_fresh = snapshot.get("status", {}).get("fresh") is True
+    refs = (cool.get("cutoff_core_c"), cool.get("cutoff_hbm_c")) if policy_fresh else ()
+    ref_label = "cutoff refs" if policy_fresh else "cutoffs stale*"
+    chart(c, y + 3, xx, inner, min(12, height - 4), f"Shared {low:g}–{high:g}C · {ref_label}", [("CORE", a, CYAN), ("HBM", b, PURPLE)], high, span, minimum=low, unit="C", references=refs)
+
+
+def workload_overview(c, collector, gpu, y, x, width, height, span):
+    idx = gpu.get("index", "?")
+    c.box(y, x, width, height, f"GPU {idx} · LOAD / POWER")
+    xx, inner = x + 2, width - 4
+    util_peak = window_range(collector, f"gpu.{idx}.util_pct", span)[1]
+    power_peak = window_range(collector, f"gpu.{idx}.power_w", span)[1]
+    cap = gpu.get("power_limit_w")
+    c.put(y + 1, xx, f"LOAD {percent(gpu.get('util_pct'))}{'' if gpu.get('stats_fresh') else '*'} · {span // 60}m peak {percent(util_peak)}"[:inner], CYAN if gpu.get("stats_fresh") else WARN)
+    c.put(y + 2, xx, f"POWER {fmt(gpu.get('power_w'), 'W')}{'' if gpu.get('stats_fresh') else '*'} · peak {fmt(power_peak, 'W')} / {fmt(cap, 'W')}{'' if gpu.get('details_fresh') else '*'} cap"[:inner], BLUE if gpu.get("stats_fresh") else WARN)
+    load, watts = paired_history(collector, f"gpu.{idx}.util_pct", f"gpu.{idx}.power_w", span, inner - 6)
+    watts = [v / cap * 100 if numeric(v) and numeric(cap) and cap > 0 and gpu.get("details_fresh") is True else None for v in watts]
+    chart(c, y + 3, xx, inner, min(12, height - 4), "Load % / power % current cap", [("LOAD", load, CYAN), ("POWER", watts, BLUE)], 100, span, unit="%")
+
+
+def fans_overview(c, snapshot, collector, y, x, width, height, span):
+    c.box(y, x, width, height, "FANS · measured RPM / PWM")
+    xx, inner = x + 2, width - 4
+    c.put(y + 1, xx, "ID     RPM    PWM    RECENT RPM"[:inner], DIM)
+    for i, fan in enumerate(snapshot.get("fans", [])[:6]):
+        fid, fresh = fan.get("fan_id", "?"), fan.get("fresh") is True
+        style = BAD if fan.get("healthy") is False else NORMAL if fresh else WARN
+        yy = y + 2 + i
+        c.put(yy, xx, f" {fid!s:<2} {fmt(fan.get('rpm')):>6}  {fmt(fan.get('pwm_pct'), '%'):>4}{'' if fresh else '*'}"[:inner], style)
+        if inner > 24:
+            vals = history(collector, f"fan.{fid}.rpm", span, inner - 21)
+            c.spark(yy, xx + 21, vals, inner - 21, 20000, CYAN if fresh else WARN)
+    if not snapshot.get("fans"):
+        c.put(y + 3, xx, "No chassis readings available"[:inner], WARN)
+    c.put(y + height - 3, xx, f"FLOOR REQ {policy_fmt(snapshot, snapshot.get('cooling', {}).get('requested_floor_pct'), '%')} · separate from feedback"[:inner], DIM if snapshot.get("status", {}).get("fresh") is True else WARN)
+    c.put(y + height - 2, xx, f"{span // 60}m RPM history · scale 0–20k"[:inner], DIM)
+
+
+def chassis_overview(c, snapshot, collector, y, x, width, height, span):
+    c.box(y, x, width, height, "CHASSIS · intake / exhaust")
+    xx, inner = x + 2, width - 4
+    sensors = snapshot.get("temperatures", [])
+    labels = []
+    for t in sensors:
+        label = {"inlet": "IN", "exhaust": "OUT", "cpu": "CPU"}.get(t.get("kind"), "TEMP")
+        if t.get("kind") == "cpu":
+            label += str(t.get("index") or "")
+        labels.append(f"{label} {fmt(t.get('temperature_c'), 'C')}{'' if t.get('fresh') else '*'}")
+    c.put(y + 1, xx, "  ".join(labels[:2])[:inner], NORMAL)
+    c.put(y + 2, xx, "  ".join(labels[2:])[:inner], NORMAL)
+    a, b = paired_history(collector, "temperature.inlet.0", "temperature.exhaust.0", span, inner - 6)
+    chart(c, y + 3, xx, inner, min(12, height - 4), "IN cyan / OUT amber", [("IN", a, CYAN), ("OUT", b, BLUE)], 60, span, unit="C")
+
+
+def memory_overview(c, collector, gpu, y, x, width, height, span):
+    idx = gpu.get("index", "?")
+    c.box(y, x, width, height, f"GPU {idx} · VRAM RESIDENCY")
+    xx, inner = x + 2, width - 4
+    used, total = gpu.get("memory_used_mb"), gpu.get("memory_total_mb")
+    current = f"{used / 1024:.1f}/{total / 1024:.1f} GiB" if numeric(used) and numeric(total) else "--"
+    lo, hi = window_range(collector, f"gpu.{idx}.memory_used_mb", span)
+    bounds = f"{lo / 1024:.1f}–{hi / 1024:.1f} GiB" if numeric(lo) and numeric(hi) else "--"
+    c.put(y + 1, xx, f"NOW {current}{'' if gpu.get('details_fresh') else '*'} · range {bounds}"[:inner], PURPLE)
+    vals = history(collector, f"gpu.{idx}.memory_used_mb", span, inner - 6)
+    vals = [v / 1024 if numeric(v) else None for v in vals]
+    chart(c, y + 2, xx, inner, min(12, height - 3), "Resident GPU memory", [("VRAM", vals, PURPLE)], total / 1024 if numeric(total) and total > 0 else 32, span, unit="GiB")
+
+
+def ram_overview(c, snapshot, collector, y, x, width, height, span):
+    c.box(y, x, width, height, "HOST RAM · residency history")
+    xx, inner = x + 2, width - 4
+    system = snapshot.get("system", {})
+    used, total = system.get("mem_used_mb"), system.get("mem_total_mb")
+    label = f"NOW {used / 1024:.1f}/{total / 1024:.1f} GiB · {percent(system.get('mem_pct'))}" if numeric(used) and numeric(total) else "RAM --"
+    c.put(y + 1, xx, label[:inner], PURPLE)
+    chart(c, y + 2, xx, inner, min(12, height - 3), "Host memory used", [("RAM", history(collector, "system.mem_pct", span, inner - 6), PURPLE)], 100, span, unit="%")
+
+
+def policy_overview(c, snapshot, collector, y, x, width, height, span):
+    c.box(y, x, width, height, "FAN CONTROL · request / feedback")
+    xx, inner = x + 2, width - 4
+    c.put(y + 1, xx, "Request amber / fan 1 measured cyan"[:inner], DIM)
+    a, b = paired_history(collector, "cooling.requested_floor_pct", "fan.1.pwm_pct", span, inner - 6)
+    chart(c, y + 2, xx, inner, min(12, height - 3), "Floor request / actual PWM", [("REQUEST", a, BLUE), ("ACTUAL", b, CYAN)], 100, span, unit="%")
+
+
+def cpu_thermal_overview(c, collector, y, x, width, height, span):
+    c.box(y, x, width, height, "CPU TEMPERATURE · sockets 1 / 2")
+    xx, inner = x + 2, width - 4
+    c.put(y + 1, xx, "CPU1 cyan / CPU2 magenta"[:inner], DIM)
+    a, b = paired_history(collector, "temperature.cpu.1", "temperature.cpu.2", span, inner - 6)
+    chart(c, y + 2, xx, inner, min(12, height - 3), "Socket temperature", [("CPU1", a, CYAN), ("CPU2", b, PURPLE)], 100, span, unit="C")
+
+
+def source_ledger(c, snapshot, y, x, width, height):
+    c.box(y, x, width, height, "SOURCES · independent freshness")
+    xx, inner = x + 2, width - 4
+    cool, status, guard = (snapshot.get(k, {}) for k in ("cooling", "status", "guard"))
+    entries = [
+        ("WATCHDOG", status.get("state") or "unknown", age(status.get("age_seconds"))),
+        ("GUARD", "healthy" if guard.get("fresh") and cool.get("guard_healthy") else "unconfirmed", age(guard.get("age_seconds"))),
+        ("CHASSIS", "fresh" if cool.get("physical_fresh") else "unconfirmed", age(cool.get("physical_age_seconds"))),
+        ("BMC SETTING", "fresh" if cool.get("setting_fresh") else "unconfirmed", age(cool.get("setting_age_seconds"))),
+    ]
+    for i, (label, state, timing) in enumerate(entries):
+        yy = y + 1 + i * 2
+        c.put(yy, xx, f"{label}  {state}"[:inner], NORMAL)
+        c.put(yy + 1, xx, timing[:inner], DIM)
+    if height > 11:
+        c.put(y + height - 3, xx, "A cached reading is not a new observation."[:inner], DIM)
+        c.put(y + height - 2, xx, "Per-source TTLs govern display validity."[:inner], DIM)
+
+
+def host_overview(c, snapshot, collector, y, width, height, span):
+    if height < 6:
+        return
+    c.box(y, 1, width - 2, height, "HOST · CPU / memory / source freshness")
+    system, cool, status, guard = (snapshot.get(k, {}) for k in ("system", "cooling", "status", "guard"))
+    inner, xx = width - 6, 3
+    left = inner // 2
+    c.put(y + 1, xx, f"CPU {percent(system.get('cpu_pct'))} · {fmt(system.get('cpu_count'))} CPUs · load {fmt(system.get('load1'), digits=2)} {fmt(system.get('load5'), digits=2)} {fmt(system.get('load15'), digits=2)}"[:left - 2], NORMAL)
+    used, total = system.get("mem_used_mb"), system.get("mem_total_mb")
+    memory = f"RAM {used / 1024:.1f}/{total / 1024:.1f} GiB" if numeric(used) and numeric(total) else "RAM --"
+    c.put(y + 1, xx + left, memory[:left - 2], PURPLE)
+    if height >= 10:
+        chart_h = min(12, height - 5)
+        chart(c, y + 2, xx, left - 3, chart_h, "CPU utilization", [("CPU", history(collector, "system.cpu_pct", span, left - 9), CYAN)], 100, span, unit="%")
+        chart(c, y + 2, xx + left, left - 3, chart_h, "Host RAM used", [("RAM", history(collector, "system.mem_pct", span, left - 9), PURPLE)], 100, span, unit="%")
+        ledger_y = y + 2 + chart_h
+    else:
+        c.spark(y + 2, xx, history(collector, "system.cpu_pct", span, left - 3), left - 3, 100, CYAN)
+        c.bar(y + 2, xx + left, left - 3, system.get("mem_pct"), 100, PURPLE)
+        ledger_y = y + 3
+    ledger = [
+        f"Watchdog {status.get('state') or 'unknown'} · {age(status.get('age_seconds'))}   Guard {age(guard.get('age_seconds'))}   Chassis {age(cool.get('physical_age_seconds'))}",
+        "Fresh readings use each source's own TTL; history gaps indicate missing evidence.",
+        f"BMC setting {'fresh' if cool.get('setting_fresh') else 'unconfirmed'} · {age(cool.get('setting_age_seconds'))} · controller route {cool.get('control_path') or 'unknown'}",
+        f"NVIDIA details {'enabled' if snapshot.get('gpu_details_enabled') else 'disabled'} · {snapshot.get('gpu_details_error') or 'no query error'}",
+        f"Swap {fmt(system.get('swap_used_mb'), 'MiB')} / {fmt(system.get('swap_total_mb'), 'MiB')} · uptime {duration(system.get('uptime_s'))}",
+        "Read only · no inference requests, BMC queries, fan writes or power changes.",
+    ]
+    for i, line in enumerate(ledger):
+        if ledger_y + i < y + height - 1:
+            c.put(ledger_y + i, xx, line[:inner], DIM)
+
+
+def render_dashboard(snapshot, collector=None, *, width=120, height=40, span=300, ascii_only=False, paused=False, view="overview"):
+    if view == "detail":
+        c = render_detail_dashboard(snapshot, collector, width=width, height=height, span=span, ascii_only=ascii_only, paused=paused)
+    elif width < 100 or height < 46 or (width < 150 and height < 54):
+        c = render_compact(snapshot, collector, width=width, height=height, span=span, ascii_only=ascii_only, paused=paused)
+    else:
+        c = Canvas(width, height, ascii_only)
+        system, cool = snapshot.get("system", {}), snapshot.get("cooling", {})
+        c.put(0, 1, "cooltop", HEADER)
+        c.put(0, 10, "PAUSED" if paused else "● LIVE", WARN if paused else GOOD)
+        c.put(0, 20, "OVERVIEW · NVIDIA + iDRAC · READ ONLY", NORMAL)
+        timestamp = snapshot.get("sampled_unix")
+        stamp = dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%H:%M:%S %Z") if numeric(timestamp) else "--"
+        c.put(0, width - len(stamp) - 2, stamp, DIM)
+        c.put(1, 1, f"{clean(system.get('hostname') or 'localhost')} · up {duration(system.get('uptime_s'))} · history {span // 60}m · paired traces preserve both colors"[:width - 2], DIM)
+        gpus = snapshot.get("gpus", [])[:2]
+        gpus += [{"index": i, "name": "No telemetry"} for i in range(len(gpus), 2)]
+        scale = shared_thermal_scale(snapshot, collector, span)
+        if width >= 150:
+            gap = 1
+            column = (width - 4) // 3
+            widths = [column, column, width - 4 - column * 2]
+            xs = [1, column + 2, column * 2 + 3]
+            top_y, top_h = 3, 13
+            mid_y, mid_h = top_y + top_h, 13 if height < 65 else 15
+            bottom_y, bottom_h = mid_y + mid_h, 13 if height < 65 else 15
+            for i, gpu in enumerate(gpus):
+                gpu_summary(c, snapshot, collector, gpu, top_y, xs[i], widths[i], top_h, span)
+                thermal_overview(c, snapshot, collector, gpu, mid_y, xs[i], widths[i], mid_h, span, scale)
+                workload_overview(c, collector, gpu, bottom_y, xs[i], widths[i], bottom_h, span)
+            cooling_summary(c, snapshot, top_y, xs[2], widths[2], top_h)
+            fans_overview(c, snapshot, collector, mid_y, xs[2], widths[2], mid_h, span)
+            chassis_overview(c, snapshot, collector, bottom_y, xs[2], widths[2], bottom_h, span)
+            body_end = bottom_y + bottom_h
+            if height >= 75:
+                residency_h = 15
+                for i, gpu in enumerate(gpus):
+                    memory_overview(c, collector, gpu, body_end, xs[i], widths[i], residency_h, span)
+                ram_overview(c, snapshot, collector, body_end, xs[2], widths[2], residency_h, span)
+                body_end += residency_h
+            if height >= 96:
+                evidence_h = 15
+                policy_overview(c, snapshot, collector, body_end, xs[0], widths[0], evidence_h, span)
+                cpu_thermal_overview(c, collector, body_end, xs[1], widths[1], evidence_h, span)
+                source_ledger(c, snapshot, body_end, xs[2], widths[2], evidence_h)
+                body_end += evidence_h
+        else:
+            column = (width - 3) // 2
+            widths, xs = [column, width - 3 - column], [1, column + 2]
+            top_y, top_h = 3, 13
+            # Keep the six physical fans near the top in narrower overview mode.
+            band_y, band_h = top_y + top_h, 11
+            plot_y, plot_h = band_y + band_h, 12
+            work_y, work_h = plot_y + plot_h, 12
+            for i, gpu in enumerate(gpus):
+                gpu_summary(c, snapshot, collector, gpu, top_y, xs[i], widths[i], top_h, span)
+                thermal_overview(c, snapshot, collector, gpu, plot_y, xs[i], widths[i], plot_h, span, scale)
+                workload_overview(c, collector, gpu, work_y, xs[i], widths[i], work_h, span)
+            fans_overview(c, snapshot, collector, band_y, xs[0], widths[0], band_h, span)
+            cooling_summary(c, snapshot, band_y, xs[1], widths[1], band_h)
+            body_end = work_y + work_h
+            if height >= 78:
+                for i, gpu in enumerate(gpus):
+                    memory_overview(c, collector, gpu, body_end, xs[i], widths[i], 14, span)
+                body_end += 14
+        remaining = height - 3 - body_end
+        if remaining >= 6:
+            host_h = remaining
+            host_overview(c, snapshot, collector, body_end, width, host_h, span)
+            body_end += host_h
+        status = snapshot.get("status", {})
+        reason = cool.get("error") or cool.get("reason") or status.get("error") or "Waiting for telemetry"
+        c.put(height - 3, 2, f"{reason} · * stale/unavailable · histories start at launch; gaps are not zero"[:width - 4], DIM)
+        refs_note = "dotted lines = configured guard cutoffs" if status.get("fresh") is True else "guard cutoff refs withheld: stale policy*"
+        c.put(height - 2, 2, f"Overview · shared GPU scale {scale[0]}–{scale[1]}C · {refs_note}"[:width - 4], DIM if status.get("fresh") is True else WARN)
+    if width >= 70 and height >= 23:
+        label = "detail" if view == "detail" else "overview"
+        c.put(height - 1, 0, " " * width)
+        c.put(height - 1, 2, f"q quit  p pause  h help  +/- [{span // 60}m]  v/Tab view [{label}]  r refresh"[:width - 4], NORMAL)
+    return c
+
+
 def help_overlay(canvas):
     lines = [
         "cooltop · keyboard & readings", "",
         "q / Esc       Quit", "p / Space     Pause / resume display", "h / ?         Close this help",
+        "v / Tab       Toggle dense overview / full chart detail",
         "+ / -         History window: 1, 5, 15 minutes", "r             Refresh local telemetry", "",
         "The dashboard never changes fans, power, or inference.",
         "Core/HBM prefer the independent guard; watchdog is the fallback.",
@@ -662,15 +1090,15 @@ def run_curses(screen, collector, args):
             background = -1
         except curses.error:
             background = curses.COLOR_BLACK
-        colors = ([252, 250, 51, 84, 220, 203, 45, 214, 207, 242] if curses.COLORS >= 256 else
+        colors = ([252, 250, 255, 84, 220, 203, 45, 214, 207, 242, 255] if curses.COLORS >= 256 else
                   [curses.COLOR_WHITE, curses.COLOR_WHITE, curses.COLOR_CYAN, curses.COLOR_GREEN,
                    curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN, curses.COLOR_YELLOW,
-                   curses.COLOR_MAGENTA, curses.COLOR_WHITE])
+                   curses.COLOR_MAGENTA, curses.COLOR_WHITE, curses.COLOR_WHITE])
         for i, color in enumerate(colors, 1):
-            curses.init_pair(i, color, background)
+            curses.init_pair(i, color, 237 if i == HEADER + 1 and curses.COLORS >= 256 else background)
     screen.keypad(True)
     screen.timeout(100)
-    span, paused, show_help = args.history, False, False
+    span, paused, show_help, view = args.history, False, False, args.view
     snapshot = collector.sample()
     deadline = time.monotonic() + args.interval
     needs_redraw, last_size = True, None
@@ -683,7 +1111,7 @@ def run_curses(screen, collector, args):
         height, width = screen.getmaxyx()
         if needs_redraw or last_size != (height, width):
             canvas = render_dashboard(snapshot, collector, width=width, height=height,
-                                      span=span, ascii_only=args.ascii, paused=paused)
+                                      span=span, ascii_only=args.ascii, paused=paused, view=view)
             if show_help:
                 help_overlay(canvas)
             draw_curses(screen, canvas)
@@ -703,6 +1131,8 @@ def run_curses(screen, collector, args):
             current = min(range(len(SPANS)), key=lambda i: abs(SPANS[i] - span))
             current = max(0, min(len(SPANS) - 1, current + (1 if key in (ord("+"), ord("=")) else -1)))
             span = SPANS[current]
+        elif key in (ord("v"), ord("V"), ord("\t")):
+            view = "detail" if view == "overview" else "overview"
         elif key in (ord("r"), ord("R")) and not paused:
             deadline = 0
 
@@ -718,6 +1148,7 @@ def parse_args(argv=None):
     parser.add_argument("--history", type=int, default=300, choices=SPANS, metavar="SECONDS", help="History display window: 60, 300 or 900 seconds")
     parser.add_argument("--ascii", action="store_true", help="Use ASCII bars for terminals without Unicode")
     parser.add_argument("--snapshot", action="store_true", help="Print one plain dashboard and exit")
+    parser.add_argument("--view", choices=("overview", "detail"), default="overview", help="Dashboard view (default: overview); v/Tab toggles live")
     parser.add_argument("--width", type=int, default=120, help="Snapshot width (70–240, default: 120)")
     parser.add_argument("--height", type=int, default=36, help="Snapshot height (23–100, default: 36)")
     args = parser.parse_args(argv)
@@ -750,7 +1181,7 @@ def main(argv=None):
                     if any(gpu.get("details_fresh") for gpu in snapshot.get("gpus", [])) or snapshot.get("gpu_details_error") not in (None, "starting"):
                         break
             print(render_dashboard(snapshot, collector, width=args.width, height=args.height,
-                                   span=args.history, ascii_only=args.ascii).text(), end="")
+                                   span=args.history, ascii_only=args.ascii, view=args.view).text(), end="")
             return 0
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             print("cooltop needs a terminal; use --snapshot for plain output.", file=sys.stderr)

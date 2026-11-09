@@ -2,7 +2,7 @@
 
 A read-only terminal dashboard for the NVIDIA GPU and iDRAC cooling telemetry. It shows live measurements and rolling history in the style of `htop` and `nvtop`.
 
-Version 0.2.0 expands the charts to use tall terminal windows. GPU temperature, utilization, and board power have labeled scales and time axes; core and HBM use separate colors, and power uses amber. VRAM, individual fan PWM/RPM histories, and inlet/exhaust trends remain visible alongside current readings. Smaller terminals retain the compact layout.
+Version 0.3.0 opens with a summary-first overview: prominent GPU temperatures, load, power and VRAM readings; compact thermal and activity histories; and measured fan feedback beside cooling status. Wider windows use three columns. Neutral title bands separate panels, while core, HBM and power retain consistent colors. A separate detail view provides the larger individual charts.
 
 The dashboard is separate from the fan controller. Starting, pausing, or quitting it does not change fans, power limits, models, or services. It never opens a BMC connection. NVIDIA's optional local telemetry query supplies device names, VRAM, power limits, and clocks; it does not run a GPU workload.
 
@@ -23,18 +23,20 @@ Run inside a terminal or an SSH session with a terminal allocated. A UTF-8 local
 | `q` or Escape | Quit the dashboard |
 | `p` or Space | Pause/resume the display |
 | `h` or `?` | Show/hide help |
+| `v` or Tab | Switch between overview and detail views |
 | `+` / `-` | Select 1, 5, or 15 minutes of history |
 | `r` | Refresh local readings |
 
 ```bash
 sudo cooltop --snapshot
 sudo cooltop --history 60
+sudo cooltop --view detail
 sudo cooltop --ascii --no-gpu-query
 ```
 
-The default display refreshes once per second; the optional NVIDIA query runs every five seconds with a two-second command timeout. `--no-gpu-query` disables that query entirely. The dashboard displays the first two GPUs and up to six fans; larger GPU inventories are marked. At 44 rows or taller, the available height becomes chart resolution. Windows with 36–43 rows use an expanded temperature chart and compact load/power histories. A 160×60 terminal gives a spacious view; 80×24 remains supported with compact panels.
+The default display refreshes once per second; the optional NVIDIA query runs every five seconds with a two-second command timeout. `--no-gpu-query` disables that query entirely. The dashboard displays the first two GPUs and up to six fans; larger GPU inventories are marked. The overview prioritizes current readings and fan feedback, bounds individual chart height, and adapts to two- or three-column arrangements. Tall windows add GPU memory residency, host memory and CPU histories, followed by fan-control and chassis-temperature detail when space permits. Detail view allocates more height to separate temperature, utilization and power charts. A 160×60 terminal gives a spacious view; 80×24 remains supported with compact panels. Select the initial view with `--view overview` or `--view detail`.
 
-History begins when the dashboard starts. It is held in memory and discarded on exit. Trend charts use step-held cached readings only while their source remains valid; bins show the peak measurement so brief thermal/load spikes remain visible. Gaps indicate unavailable or expired telemetry. Stored measurements remain actual deduplicated observations. Requested fan floor and measured fan PWM/RPM are displayed separately. A loaded model can consume VRAM while GPU utilization is idle.
+History begins when the dashboard starts. It is held in memory and discarded on exit. Trend charts use step-held cached readings only while their source remains valid; bins show the peak measurement so brief thermal/load spikes remain visible. Gaps indicate unavailable or expired telemetry. Stored measurements remain actual deduplicated observations. Requested fan floor and measured fan PWM/RPM are displayed separately. A loaded model can consume VRAM while GPU utilization is idle. Core and HBM share a thermal scale; dotted reference lines show the configured guard cutoffs. The current temperature values warn as they approach those limits. Selected-window ranges use separate minimum and maximum aggregation. Power percentages require a fresh, positive cap reading; stale caps remain marked in watts and are not used to normalize charts.
 
 ## Install manually
 
